@@ -1,0 +1,35 @@
+"""boot.py — runs on every reset before main.py.
+Brings up WiFi automatically and exposes private host info.
+
+To set up on a fresh board:
+  1. Copy this file to boot.py (in this folder), fill in the values below
+  2. Upload to the device: mpremote cp boot.py :/boot.py
+  3. Reset the board
+
+NOTE: boot.py is gitignored. Do not commit your filled-in version.
+
+Other modules can import these constants: `from boot import OKDEMERZEL_HOST`
+"""
+import network
+import time
+
+WIFI_SSID = "your-ssid-here"
+WIFI_PASSWORD = "your-password-here"
+
+# Private LAN host running whisper.cpp / TTS / etc.
+OKDEMERZEL_HOST = "192.168.x.x"
+WHISPER_PORT = 8891
+
+wlan = network.WLAN(network.STA_IF)
+wlan.active(True)
+if not wlan.isconnected():
+    print("boot.py: connecting to", WIFI_SSID)
+    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    for _ in range(20):
+        if wlan.isconnected():
+            break
+        time.sleep(0.5)
+if wlan.isconnected():
+    print("boot.py: WiFi up", wlan.ifconfig()[0])
+else:
+    print("boot.py: WiFi connect failed, status", wlan.status())

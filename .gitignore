@@ -1,0 +1,27 @@
+# MicroPython boot file with WiFi credentials
+tests/boot.py
+
+# Python venv
+.venv/
+
+# Recordings and audio scratch files
+tests/audio/*.raw
+tests/audio/*.wav
+tests/rec_*.raw
+tests/rec_*.wav
+
+# Firmware binaries (large, downloadable)
+firmware/*.bin
+
+# Arduino tooling cache + binaries (downloadable, not committed)
+tools/arduino15/
+tools/arduino-cli.zip
+tools/arduino-cli.exe
+tools/LICENSE.txt
+tools/arduino-cli.yaml
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
