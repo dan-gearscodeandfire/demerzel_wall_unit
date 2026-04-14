@@ -93,11 +93,17 @@ def compose(router: dict, tool_result: str, user_query: str) -> str:
 
     # ha_action paths: short ack regardless of underlying result
     if router.get("intent") == "ha_command":
-        if "could not find entity" in tool_result:
-            return f"I couldn't find that. {tool_result}".replace("could not find entity matching", "Specifically, no match for")
+        if "could not find entity" in tool_result or "could not find" in tool_result:
+            return "I couldn't find that device."
         if "error" in tool_result.lower() or "failed" in tool_result.lower():
             return f"Something went wrong. {tool_result}"
         return GOT_IT_PHRASES[0]
+
+    # ha_query: a sensor reading, naturalize via the small LLM
+    if router.get("tool") == "ha_query":
+        if "could not find" in tool_result:
+            return "I couldn't find that sensor."
+        return _summarize(user_query, tool_result)
 
     # llm_chat path: result is already a natural reply
     if router.get("tool") == "llm_chat":

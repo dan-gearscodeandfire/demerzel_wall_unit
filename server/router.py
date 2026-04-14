@@ -32,7 +32,9 @@ LLM_TIMEOUT = 15
 ROUTER_SYSTEM_PROMPT = """You are the intent router for Demerzel, a household voice assistant. \
 Given a user utterance, classify it into a JSON object with EXACTLY these fields:
 
-- intent: one of "ha_command", "calendar", "email", "query", "chat", "system"
+- intent: one of "ha_command", "ha_query", "calendar", "email", "query", "chat", "system"
+    - ha_command: change the state of a device (turn on/off, set brightness, lock/unlock)
+    - ha_query: read the state of a sensor or entity (temperature, humidity, lock state, lights on/off)
 - latency_class: one of "instant", "quick", "slow"
     - instant: trivial action, no thinking needed (e.g. turn off lights)
     - quick:   simple lookup answered in <500ms (e.g. what time is it)
@@ -41,9 +43,10 @@ Given a user utterance, classify it into a JSON object with EXACTLY these fields
     - got_it:             after performing an action, just say "Got it."
     - acknowledge_first:  for slow lookups, say a brief ack ("Let me check") then the real answer
     - answer_only:        speak the answer directly, no ack
-- tool: one of "ha_action", "n8n_calendar", "n8n_email", "llm_chat"
+- tool: one of "ha_action", "ha_query", "n8n_calendar", "n8n_email", "llm_chat"
 - params: object with parameters appropriate for the tool
     - ha_action: {"domain": "light|switch|cover|...", "service": "turn_on|turn_off|toggle|...", "entity": "<entity_id or human name>"}
+    - ha_query: {"entity": "<friendly name like 'den temperature' or 'shop multisensor'>"}
     - n8n_calendar: {"query": "<paraphrased question>"}
     - n8n_email: {"query": "<paraphrased question>"}
     - llm_chat: {"prompt": "<the user utterance>"}
@@ -68,6 +71,15 @@ User: "tell me a joke"
 
 User: "do I have any unread email"
 {"intent":"email","latency_class":"slow","verbal_response":"acknowledge_first","tool":"n8n_email","params":{"query":"unread email count"},"ack_phrase":"Let me check","confidence":0.94}
+
+User: "what's the temperature in the den"
+{"intent":"ha_query","latency_class":"quick","verbal_response":"answer_only","tool":"ha_query","params":{"entity":"den temperature"},"confidence":0.96}
+
+User: "is the front door locked"
+{"intent":"ha_query","latency_class":"quick","verbal_response":"answer_only","tool":"ha_query","params":{"entity":"front door lock"},"confidence":0.94}
+
+User: "how warm is it in the shop"
+{"intent":"ha_query","latency_class":"quick","verbal_response":"answer_only","tool":"ha_query","params":{"entity":"shop temperature"},"confidence":0.94}
 """
 
 

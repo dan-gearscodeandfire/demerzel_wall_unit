@@ -6,10 +6,15 @@ The voice-server passes that result to the response composer.
 import logging
 import os
 import re
+import time
 
 import requests
 
 log = logging.getLogger("tools")
+
+# In-process cache for HA /api/states so we don't hit it on every action.
+_HA_STATES_CACHE = {"ts": 0.0, "data": None}
+HA_STATES_TTL = 60.0  # seconds
 
 HA_URL = os.environ.get("HA_URL", "http://192.168.1.96:8123").rstrip("/")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
@@ -31,42 +36,91 @@ def _ha_headers():
     }
 
 
-def _ha_resolve_entity(domain: str, hint: str) -> str | None:
-    """Resolve a fuzzy entity hint to a real HA entity_id.
+def _ha_get_states(force: bool = False) -> list:
+    """Return cached /api/states or refresh if expired."""
+    now = time.monotonic()
+    if not force and _HA_STATES_CACHE["data"] is not None and (now - _HA_STATES_CACHE["ts"]) < HA_STATES_TTL:
+        return _HA_STATES_CACHE["data"]
+    try:
+        r = requests.get(f"{HA_URL}/api/states", headers=_ha_headers(), timeout=HA_TIMEOUT)
+        r.raise_for_status()
+        states = r.json()
+        _HA_STATES_CACHE["data"] = states
+        _HA_STATES_CACHE["ts"] = now
+        log.info("HA states cache refreshed: %d entities", len(states))
+        return states
+    except Exception as e:
+        log.warning("HA states fetch failed: %s", e)
+        return _HA_STATES_CACHE["data"] or []
 
-    Strategies (in order):
-    1. If hint is already a full entity_id (contains a dot), use as-is
-    2. If hint is "all" or empty, return f"{domain}.all" (HA accepts this for groups)
-    3. Look up all entities in the domain, find one whose friendly name matches hint
-    """
+
+_TOKEN_RX = re.compile(r"[a-z0-9]+")
+
+
+def _tokens(s: str) -> list[str]:
+    return _TOKEN_RX.findall(s.lower())
+
+
+def _ha_find_entity(hint: str, domain_filter: str | None = None) -> dict | None:
+    """Find an HA entity state by friendly name. Token-based matching:
+    every word in the hint must appear in the friendly name (or entity_id)."""
+    if not hint:
+        return None
+    states = _ha_get_states()
+
+    if "." in hint:
+        for s in states:
+            if s["entity_id"] == hint:
+                return s
+        return None
+
+    hint_tokens = _tokens(hint)
+    if not hint_tokens:
+        return None
+
+    def candidate_score(entity):
+        eid = entity["entity_id"]
+        if domain_filter and not eid.startswith(f"{domain_filter}."):
+            return -1
+        fn = entity.get("attributes", {}).get("friendly_name", "")
+        fn_tokens = set(_tokens(fn))
+        eid_tokens = set(_tokens(eid))
+        all_tokens = fn_tokens | eid_tokens
+        # All hint tokens must appear somewhere
+        if not all(t in all_tokens for t in hint_tokens):
+            return -1
+        # Score: full friendly-name match > all-tokens-in-friendly-name > all-tokens-in-eid
+        fn_norm = re.sub(r"\s+", "", fn.lower())
+        hint_norm = re.sub(r"\s+", "", hint.lower())
+        if fn_norm == hint_norm:
+            return 1000
+        score = 0
+        if all(t in fn_tokens for t in hint_tokens):
+            score += 100
+        # Bonus: shorter friendly name is more specific
+        score -= len(fn_tokens)
+        return score
+
+    best = None
+    best_score = -1
+    for s in states:
+        score = candidate_score(s)
+        if score > best_score:
+            best_score = score
+            best = s
+    return best if best_score >= 0 else None
+
+
+def _ha_resolve_entity(domain: str, hint: str) -> str | None:
+    """Resolve a fuzzy entity hint to a real HA entity_id within a domain."""
     if not hint:
         return f"{domain}.all"
     if "." in hint:
         return hint
     if hint.lower() in ("all", "every", "everything"):
-        return "all"  # HA service call accepts entity_id="all"
-    try:
-        r = requests.get(f"{HA_URL}/api/states", headers=_ha_headers(), timeout=HA_TIMEOUT)
-        r.raise_for_status()
-        states = r.json()
-        hint_norm = re.sub(r"\s+", "", hint.lower())
-        # Exact friendly_name match first
-        for s in states:
-            if not s["entity_id"].startswith(f"{domain}."):
-                continue
-            fn = s.get("attributes", {}).get("friendly_name", "")
-            if fn and re.sub(r"\s+", "", fn.lower()) == hint_norm:
-                return s["entity_id"]
-        # Substring match
-        for s in states:
-            if not s["entity_id"].startswith(f"{domain}."):
-                continue
-            fn = s.get("attributes", {}).get("friendly_name", "")
-            if fn and hint_norm in re.sub(r"\s+", "", fn.lower()):
-                return s["entity_id"]
-    except Exception as e:
-        log.warning("HA entity resolution failed: %s", e)
-    return None
+        return "all"
+    state = _ha_find_entity(hint, domain_filter=domain)
+    return state["entity_id"] if state else None
 
 
 def ha_action(params: dict) -> str:
@@ -94,6 +148,30 @@ def ha_action(params: dict) -> str:
         return f"HA error {e.response.status_code}: {e.response.text[:200]}"
     except Exception as e:
         return f"HA call failed: {e}"
+
+
+def ha_query(params: dict) -> str:
+    """Read the state of an HA sensor or any entity by friendly name.
+
+    params: {"entity": "<friendly name or entity_id>", "attribute": "<optional attribute>"}
+
+    Returns a string like "76.9 F" or "76.9 °F" suitable for the composer.
+    """
+    hint = params.get("entity") or ""
+    attr = params.get("attribute")
+    state = _ha_find_entity(hint)
+    if state is None:
+        return f"could not find an entity matching '{hint}'"
+    eid = state["entity_id"]
+    fn = state.get("attributes", {}).get("friendly_name", eid)
+    if attr:
+        val = state.get("attributes", {}).get(attr)
+        if val is None:
+            return f"{fn} has no attribute '{attr}'"
+        return f"{fn} {attr}: {val}"
+    val = state.get("state", "")
+    unit = state.get("attributes", {}).get("unit_of_measurement", "")
+    return f"{fn} is {val} {unit}".strip()
 
 
 # ---------- n8n webhooks ----------
@@ -213,6 +291,7 @@ def llm_chat(params: dict) -> str:
 
 DISPATCH = {
     "ha_action": ha_action,
+    "ha_query": ha_query,
     "n8n_calendar": n8n_calendar,
     "n8n_email": n8n_email,
     "llm_chat": llm_chat,
