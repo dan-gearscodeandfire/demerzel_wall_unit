@@ -16,7 +16,6 @@ time.sleep(1)
 print("            1...")
 time.sleep(1)
 print(">>> SPEAK NOW (8 seconds) <<<")
-print(">>> Suggested phrase: 'The quick brown fox jumps over the lazy dog' <<<")
 
 rec_buf = bytearray(16000 * 4 * 8)
 mv = memoryview(rec_buf)
