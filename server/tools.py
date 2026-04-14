@@ -55,10 +55,24 @@ def _ha_get_states(force: bool = False) -> list:
 
 
 _TOKEN_RX = re.compile(r"[a-z0-9]+")
+_STOPWORDS = {"the", "a", "an", "in", "on", "at", "of", "to", "for", "is", "are",
+              "and", "or", "hey", "please", "can", "you", "my"}
+
+
+def _stem(t: str) -> str:
+    """Naive English plural stripper so 'lights' matches 'light'."""
+    if len(t) > 3 and t.endswith("ies"):
+        return t[:-3] + "y"
+    if len(t) > 3 and t.endswith("es") and t[-3] in "sxz":
+        return t[:-2]
+    if len(t) > 3 and t.endswith("s") and not t.endswith("ss"):
+        return t[:-1]
+    return t
 
 
 def _tokens(s: str) -> list[str]:
-    return _TOKEN_RX.findall(s.lower())
+    raw = _TOKEN_RX.findall(s.lower())
+    return [_stem(t) for t in raw if t not in _STOPWORDS]
 
 
 def _ha_find_entity(hint: str, domain_filter: str | None = None) -> dict | None:

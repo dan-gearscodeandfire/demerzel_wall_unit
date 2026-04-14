@@ -14,6 +14,16 @@ import time
 import gc
 
 try:
+    import neopixel
+    _NP = neopixel.NeoPixel(Pin(48), 1)
+    def led(r, g, b):
+        _NP[0] = (r, g, b)
+        _NP.write()
+except Exception:
+    def led(r, g, b):
+        pass
+
+try:
     from boot import OKDEMERZEL_HOST
 except ImportError:
     OKDEMERZEL_HOST = "192.168.1.156"
@@ -33,7 +43,7 @@ AMP_DIN = 7
 AMP_SD_MODE = 12
 
 RECORD_RATE = 16000
-RECORD_SECONDS = 5
+RECORD_SECONDS = 8
 
 
 # ---------- record ----------
@@ -212,34 +222,53 @@ def play_wav(wav_bytes):
 # ---------- main ----------
 
 def main():
-    print("=== Stage 1 voice turn ===")
+    print("=== DWU voice turn ===")
+    print()
+    print("LED key: amber=countdown  RED=RECORDING  blue=processing  green=playing")
+    print()
 
-    print("\n[1/4] Recording %d s from INMP441..." % RECORD_SECONDS)
-    print("    >>> SPEAK NOW <<<")
+    # Visible countdown — LED amber while counting
+    for n in (5, 4, 3, 2, 1):
+        led(60, 30, 0)  # amber
+        print("  Speak in %d..." % n)
+        time.sleep(1)
+
+    # Recording phase — LED RED, very obvious
+    led(120, 0, 0)
+    print()
+    print("###################################################")
+    print("###  >>>>  SPEAK NOW  <<<< RECORDING %d SECONDS  ###" % RECORD_SECONDS)
+    print("###################################################")
+    print()
     t0 = time.ticks_ms()
     pcm = record_pcm16(RECORD_SECONDS)
-    print("    recorded %d bytes in %d ms" % (len(pcm), time.ticks_diff(time.ticks_ms(), t0)))
+    led(0, 0, 0)
+    print("recorded %d bytes in %d ms" % (len(pcm), time.ticks_diff(time.ticks_ms(), t0)))
 
-    print("\n[2/4] Wrapping WAV + POSTing to %s:%d..." % (OKDEMERZEL_HOST, VOICE_PORT))
+    led(0, 0, 100)  # blue = processing
+    print("Uploading + processing on okDemerzel...")
     wav_in = wrap_wav(pcm)
     del pcm
     gc.collect()
     t1 = time.ticks_ms()
     wav_out, meta = post_voice_turn(wav_in)
-    print("    round-trip %d ms, response %d bytes" % (time.ticks_diff(time.ticks_ms(), t1), len(wav_out)))
+    print("round-trip %d ms, response %d bytes" % (time.ticks_diff(time.ticks_ms(), t1), len(wav_out)))
     del wav_in
     gc.collect()
 
-    print("\n[3/4] Server metadata:")
-    print("    X-Transcript: %s" % meta["transcript"])
-    print("    X-Reply-Text: %s" % meta["reply_text"])
-    print("    X-Latency-Ms: %s" % meta["latency_ms"])
+    print()
+    print("Heard:    %s" % meta["transcript"])
+    print("Replying: %s" % meta["reply_text"])
+    print("Server:   %s ms" % meta["latency_ms"])
+    print()
 
-    print("\n[4/4] Playing response...")
+    led(0, 100, 0)  # green = playing
+    print("Playing response...")
     play_wav(wav_out)
-    print("    done.")
-
-    print("\n=== Total wall time: %d ms ===" % time.ticks_diff(time.ticks_ms(), t0))
+    led(0, 0, 0)
+    print("done.")
+    print()
+    print("=== Total wall time: %d ms ===" % time.ticks_diff(time.ticks_ms(), t0))
 
 
 main()
