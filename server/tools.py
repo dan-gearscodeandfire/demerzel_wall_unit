@@ -77,7 +77,14 @@ def _tokens(s: str) -> list[str]:
 
 def _ha_find_entity(hint: str, domain_filter: str | None = None) -> dict | None:
     """Find an HA entity state by friendly name. Token-based matching:
-    every word in the hint must appear in the friendly name (or entity_id)."""
+    every word in the hint must appear in the friendly name (or entity_id).
+
+    Scoring tiers (highest wins):
+      - exact friendly-name match                      -> 1000
+      - all hint tokens found in the friendly_name     -> 100 - len(fn_tokens)
+      - all hint tokens found only via the entity_id   -> 0   - len(fn_tokens)
+    Entities whose tokens don’t cover the hint return None and are excluded.
+    """
     if not hint:
         return None
     states = _ha_get_states()
@@ -95,34 +102,35 @@ def _ha_find_entity(hint: str, domain_filter: str | None = None) -> dict | None:
     def candidate_score(entity):
         eid = entity["entity_id"]
         if domain_filter and not eid.startswith(f"{domain_filter}."):
-            return -1
+            return None
         fn = entity.get("attributes", {}).get("friendly_name", "")
         fn_tokens = set(_tokens(fn))
         eid_tokens = set(_tokens(eid))
         all_tokens = fn_tokens | eid_tokens
-        # All hint tokens must appear somewhere
+        # All hint tokens must appear somewhere (fn OR eid)
         if not all(t in all_tokens for t in hint_tokens):
-            return -1
-        # Score: full friendly-name match > all-tokens-in-friendly-name > all-tokens-in-eid
+            return None
+        # Exact friendly-name match
         fn_norm = re.sub(r"\s+", "", fn.lower())
         hint_norm = re.sub(r"\s+", "", hint.lower())
         if fn_norm == hint_norm:
             return 1000
-        score = 0
-        if all(t in fn_tokens for t in hint_tokens):
-            score += 100
-        # Bonus: shorter friendly name is more specific
+        # Tier-1 bonus if friendly_name carries all tokens (more natural match)
+        score = 100 if all(t in fn_tokens for t in hint_tokens) else 0
+        # Specificity: prefer shorter friendly names within the same tier
         score -= len(fn_tokens)
         return score
 
     best = None
-    best_score = -1
+    best_score = None
     for s in states:
         score = candidate_score(s)
-        if score > best_score:
+        if score is None:
+            continue
+        if best_score is None or score > best_score:
             best_score = score
             best = s
-    return best if best_score >= 0 else None
+    return best
 
 
 def _ha_resolve_entity(domain: str, hint: str) -> str | None:

@@ -9,6 +9,10 @@ server/env.local
 # Python venv
 .venv/
 
+# Python bytecode
+**/__pycache__/
+*.pyc
+
 # Recordings and audio scratch files (entire scratch dir)
 tests/audio/
 tests/rec_*.raw
