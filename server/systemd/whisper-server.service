@@ -1,0 +1,26 @@
+[Unit]
+Description=whisper.cpp HTTP STT server
+Documentation=https://github.com/ggerganov/whisper.cpp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gearscodeandfire
+Group=gearscodeandfire
+WorkingDirectory=/home/gearscodeandfire/whisper-cpp
+ExecStart=/home/gearscodeandfire/whisper-cpp/build/bin/whisper-server \
+    -m /home/gearscodeandfire/whisper-cpp/models/ggml-base.en.bin \
+    --host 0.0.0.0 \
+    --port 8891 \
+    -t 4 \
+    -l en
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:/home/gearscodeandfire/demerzel/logs/whisper-server.log
+StandardError=append:/home/gearscodeandfire/demerzel/logs/whisper-server.log
+KillMode=process
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

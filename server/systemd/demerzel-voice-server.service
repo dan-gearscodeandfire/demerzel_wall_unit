@@ -1,0 +1,24 @@
+[Unit]
+Description=Demerzel Voice Server (DWU STT/TTS bridge)
+Documentation=https://github.com/dan-gearscodeandfire/demerzel_wall_unit
+After=network-online.target
+Wants=network-online.target
+# whisper-server isn't a strict dep — voice-server starts and only needs whisper at request time
+After=whisper-server.service
+
+[Service]
+Type=simple
+User=gearscodeandfire
+Group=gearscodeandfire
+WorkingDirectory=/home/gearscodeandfire/demerzel/voice-server
+ExecStart=/home/gearscodeandfire/demerzel/voice-server/.venv/bin/python voice_server.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=append:/home/gearscodeandfire/demerzel/logs/voice-server.log
+StandardError=append:/home/gearscodeandfire/demerzel/logs/voice-server.log
+# Don't kill the whole process group on stop — voice_server is a single proc
+KillMode=process
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target
