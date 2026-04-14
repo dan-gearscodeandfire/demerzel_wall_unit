@@ -4,9 +4,8 @@ tests/boot.py
 # Python venv
 .venv/
 
-# Recordings and audio scratch files
-tests/audio/*.raw
-tests/audio/*.wav
+# Recordings and audio scratch files (entire scratch dir)
+tests/audio/
 tests/rec_*.raw
 tests/rec_*.wav
 
