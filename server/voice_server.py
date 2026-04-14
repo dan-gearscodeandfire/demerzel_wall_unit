@@ -28,6 +28,10 @@ import wave
 import requests
 from aiohttp import web
 
+import router as router_mod
+import tools as tools_mod
+import composer as composer_mod
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -72,11 +76,28 @@ def synthesize(text: str) -> bytes:
             pass
 
 
-def compose_reply(transcript: str) -> str:
-    """Stage 1: hardcoded response so we can see the loop work end-to-end."""
+def stage2_pipeline(transcript: str) -> tuple[str, dict]:
+    """Stage 2: route → dispatch → compose. Returns (spoken_text, debug_info)."""
+    debug = {}
     if not transcript:
-        return "I did not catch that."
-    return f"You said: {transcript}"
+        return "I did not catch that.", {"reason": "empty_transcript"}
+
+    t0 = time.monotonic()
+    decision = router_mod.route(transcript)
+    debug["router_ms"] = int((time.monotonic() - t0) * 1000)
+    debug["router"] = decision
+    log.info("router decision: %s", json.dumps({k: v for k, v in decision.items() if k != "params"}))
+
+    t1 = time.monotonic()
+    tool_result = tools_mod.dispatch(decision["tool"], decision.get("params", {}))
+    debug["tool_ms"] = int((time.monotonic() - t1) * 1000)
+    debug["tool_result"] = tool_result[:500] if isinstance(tool_result, str) else str(tool_result)[:500]
+
+    t2 = time.monotonic()
+    spoken = composer_mod.compose(decision, tool_result, transcript)
+    debug["compose_ms"] = int((time.monotonic() - t2) * 1000)
+
+    return spoken, debug
 
 
 async def voice_turn(request: web.Request) -> web.Response:
@@ -91,7 +112,12 @@ async def voice_turn(request: web.Request) -> web.Response:
         return web.json_response({"error": "whisper_failed", "detail": str(e)}, status=500)
     log.info("transcript: %r", transcript)
 
-    reply = compose_reply(transcript)
+    try:
+        reply, debug = stage2_pipeline(transcript)
+    except Exception as e:
+        log.exception("stage2 pipeline failed")
+        reply = "Sorry, something went wrong."
+        debug = {"error": str(e)}
     log.info("reply: %r", reply)
 
     try:
@@ -110,15 +136,58 @@ async def voice_turn(request: web.Request) -> web.Response:
         # Strip CR/LF/NUL and cap length so we never fail header serialization
         return " ".join(s.split())[:500]
 
+    headers = {
+        "X-Transcript": hdr_safe(transcript),
+        "X-Reply-Text": hdr_safe(reply),
+        "X-Latency-Ms": str(elapsed_ms),
+    }
+    # Surface stage-2 routing decisions for debugging
+    if debug.get("router"):
+        d = debug["router"]
+        headers["X-Router-Model"] = hdr_safe(str(d.get("_router_model", "")))
+        headers["X-Router-Intent"] = hdr_safe(str(d.get("intent", "")))
+        headers["X-Router-Tool"] = hdr_safe(str(d.get("tool", "")))
+        headers["X-Router-Confidence"] = hdr_safe(str(d.get("confidence", "")))
+    if debug.get("router_ms") is not None:
+        headers["X-Router-Ms"] = str(debug["router_ms"])
+    if debug.get("tool_ms") is not None:
+        headers["X-Tool-Ms"] = str(debug["tool_ms"])
+    if debug.get("compose_ms") is not None:
+        headers["X-Compose-Ms"] = str(debug["compose_ms"])
+
     return web.Response(
         body=wav_out,
         content_type="audio/wav",
-        headers={
-            "X-Transcript": hdr_safe(transcript),
-            "X-Reply-Text": hdr_safe(reply),
-            "X-Latency-Ms": str(elapsed_ms),
-        },
+        headers=headers,
     )
+
+
+async def voice_text(request: web.Request) -> web.Response:
+    """Test endpoint: accept a text utterance directly, skip whisper. Returns JSON
+    with the router decision, tool result, and composed reply (no TTS audio).
+    Useful for fast iteration on Stage 2 routing logic."""
+    t0 = time.monotonic()
+    body = await request.json()
+    text = body.get("text", "").strip()
+    if not text:
+        return web.json_response({"error": "missing text"}, status=400)
+    log.info("voice_text input: %r", text)
+    try:
+        reply, debug = stage2_pipeline(text)
+    except Exception as e:
+        log.exception("stage2 pipeline failed")
+        return web.json_response({"error": str(e)}, status=500)
+    elapsed_ms = int((time.monotonic() - t0) * 1000)
+    return web.json_response({
+        "transcript": text,
+        "reply": reply,
+        "router": debug.get("router"),
+        "tool_result": debug.get("tool_result"),
+        "router_ms": debug.get("router_ms"),
+        "tool_ms": debug.get("tool_ms"),
+        "compose_ms": debug.get("compose_ms"),
+        "total_ms": elapsed_ms,
+    })
 
 
 async def health(request: web.Request) -> web.Response:
@@ -133,6 +202,7 @@ async def health(request: web.Request) -> web.Response:
 def main():
     app = web.Application(client_max_size=10 * 1024 * 1024)  # 10 MB max upload
     app.router.add_post("/voice_turn", voice_turn)
+    app.router.add_post("/voice_text", voice_text)
     app.router.add_get("/health", health)
     log.info("starting on %s:%d", LISTEN_HOST, LISTEN_PORT)
     web.run_app(app, host=LISTEN_HOST, port=LISTEN_PORT, access_log=None)

@@ -1,6 +1,11 @@
 # MicroPython boot file with WiFi credentials
 tests/boot.py
 
+# Server env files with secrets (HA token, etc) - never commit
+server/env
+server/env.local
+**/env
+
 # Python venv
 .venv/
 

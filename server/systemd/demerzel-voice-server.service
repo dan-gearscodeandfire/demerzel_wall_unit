@@ -11,6 +11,7 @@ Type=simple
 User=gearscodeandfire
 Group=gearscodeandfire
 WorkingDirectory=/home/gearscodeandfire/demerzel/voice-server
+EnvironmentFile=-/home/gearscodeandfire/demerzel/voice-server/env
 ExecStart=/home/gearscodeandfire/demerzel/voice-server/.venv/bin/python voice_server.py
 Restart=on-failure
 RestartSec=3
