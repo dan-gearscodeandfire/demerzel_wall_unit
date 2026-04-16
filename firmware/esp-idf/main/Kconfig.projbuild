@@ -1,0 +1,42 @@
+menu "DWU Configuration"
+
+    config DWU_WIFI_SSID
+        string "WiFi SSID"
+        default "okfrederick"
+
+    config DWU_WIFI_PASS
+        string "WiFi password"
+        default ""
+
+    config DWU_OKDEMERZEL_HOST
+        string "okDemerzel server IP"
+        default "192.168.1.156"
+
+    config DWU_OKDEMERZEL_PORT
+        int "Voice server port"
+        default 8900
+
+    config DWU_ROOM_NAME
+        string "Room name (mDNS hostname: dwu-<name>)"
+        default "den"
+
+    config DWU_MIC_ID
+        string "Mic ID (sent in request headers)"
+        default "dwu-den"
+
+    config DWU_LOG_TCP_PORT
+        int "TCP log server port"
+        default 8901
+
+    config DWU_RECORD_SECONDS
+        int "Recording duration (seconds)"
+        default 8
+
+    config DWU_TEST_ALL_DRIVERS
+        bool "Run all-driver self-test on boot"
+        default n
+        help
+            When enabled, main.c runs each peripheral driver's self-test
+            in sequence instead of the normal voice_turn loop.
+
+endmenu

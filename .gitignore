@@ -26,6 +26,12 @@ wake_word_samples/
 # Firmware binaries (large, downloadable)
 firmware/*.bin
 
+# ESP-IDF build artifacts
+firmware/esp-idf/build/
+firmware/esp-idf/sdkconfig
+firmware/esp-idf/sdkconfig.old
+firmware/esp-idf/managed_components/
+
 # Arduino tooling cache + binaries (downloadable, not committed)
 tools/arduino15/
 tools/arduino-cli.zip
