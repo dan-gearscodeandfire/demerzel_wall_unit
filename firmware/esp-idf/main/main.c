@@ -8,6 +8,7 @@
 #include "ld2410c.h"
 #include "audio_in.h"
 #include "audio_out.h"
+#include "wake_word_task.h"
 
 #include "nvs_flash.h"
 #include "esp_log.h"
@@ -21,16 +22,15 @@
 
 static const char *TAG = "dwu";
 
-#define PIR_MOTION_BIT   BIT0
-#define COOLDOWN_MS      10000
+#define WAKE_WORD_BIT   BIT0
 
 static EventGroupHandle_t s_trigger_events;
 
+// PIR callback retained for future presence-gating use; no longer triggers
+// voice_turn. The wake-word task is the sole trigger source.
 static void pir_callback(bool motion)
 {
-    if (motion) {
-        xEventGroupSetBits(s_trigger_events, PIR_MOTION_BIT);
-    }
+    (void)motion;
 }
 
 static void log_heap_stats(void)
@@ -102,9 +102,8 @@ static void run_driver_tests(void)
     }
     ESP_LOGI(TAG, "  PASS: LD2410C polled");
 
-    // Mic
+    // Mic — audio_in is already initialized in app_main before this runs.
     ESP_LOGI(TAG, "[5/6] audio_in (3s record)");
-    audio_in_init();
     size_t test_samples = 16000 * 3;
     int16_t *test_buf = heap_caps_malloc(test_samples * 2, MALLOC_CAP_SPIRAM);
     if (test_buf) {
@@ -127,7 +126,6 @@ static void run_driver_tests(void)
         }
         heap_caps_free(test_buf);
     }
-    audio_in_deinit();
 
     // Amp
     ESP_LOGI(TAG, "[6/6] audio_out (440 Hz, 2s)");
@@ -189,6 +187,14 @@ void app_main(void)
     bme280_init();
     ld2410c_init();
 
+    // Audio capture is always-on from this point — wake-word task drains the
+    // wake ring continuously; voice_turn arms the capture ring on demand.
+    ret = audio_in_init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "audio_in_init failed: %s", esp_err_to_name(ret));
+        status_led_set(LED_RED);
+    }
+
     log_heap_stats();
 
     // OTA check (non-blocking if no update available)
@@ -204,13 +210,20 @@ void app_main(void)
     while (1) { vTaskDelay(pdMS_TO_TICKS(10000)); }
 #endif
 
-    // Main voice_turn loop
+    // Main voice_turn loop — gated on wake-word, not PIR.
     s_trigger_events = xEventGroupCreate();
-    ESP_LOGI(TAG, "Ready — waiting for PIR trigger...");
+
+    ret = wake_word_task_start(s_trigger_events, WAKE_WORD_BIT);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "wake_word_task_start failed: %s", esp_err_to_name(ret));
+        status_led_set(LED_RED);
+    } else {
+        ESP_LOGI(TAG, "Ready — listening for wake word (\"Yo Demerzel\")");
+    }
     status_led_set(LED_OFF);
 
     while (1) {
-        xEventGroupWaitBits(s_trigger_events, PIR_MOTION_BIT,
+        xEventGroupWaitBits(s_trigger_events, WAKE_WORD_BIT,
                             pdTRUE, pdFALSE, portMAX_DELAY);
 
         if (!wifi_is_connected()) {
@@ -221,7 +234,17 @@ void app_main(void)
             continue;
         }
 
+        // Pause wake-word inference while we record + play the turn.
+        // The task's own post-detect mute is timer-based and shorter than a
+        // full turn (~18 s), so without this our TTS playback would re-fire
+        // the wake word mid-response.
+        wake_word_task_pause();
         ret = voice_turn_execute();
+        // Allow a brief settle + flush after playback before we listen again,
+        // so the tail of the TTS audio can't trip the wake word.
+        vTaskDelay(pdMS_TO_TICKS(500));
+        wake_word_task_resume();
+
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "voice_turn failed: %s", esp_err_to_name(ret));
             status_led_set(LED_RED);
@@ -230,9 +253,5 @@ void app_main(void)
 
         status_led_set(LED_OFF);
         log_heap_stats();
-
-        // Cooldown — ignore PIR triggers for a bit
-        vTaskDelay(pdMS_TO_TICKS(COOLDOWN_MS));
-        xEventGroupClearBits(s_trigger_events, PIR_MOTION_BIT);
     }
 }

@@ -50,7 +50,7 @@ esp_err_t voice_turn_execute(void)
 
     // Brief heads-up + audible "start" beep (higher pitch)
     status_led_set(LED_AMBER);
-    ESP_LOGI(TAG, "PIR triggered — beep + recording starts...");
+    ESP_LOGI(TAG, "Wake word detected — beep + recording starts...");
     beep(1200, 200, 16000);  // 1200 Hz, 200 ms
     vTaskDelay(pdMS_TO_TICKS(150));
 
@@ -66,18 +66,9 @@ esp_err_t voice_turn_execute(void)
         return ESP_ERR_NO_MEM;
     }
 
-    ret = audio_in_init();
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "audio_in_init failed: %s", esp_err_to_name(ret));
-        heap_caps_free(pcm);
-        status_led_set(LED_RED);
-        return ret;
-    }
-
     size_t actual = 0;
     int64_t t_rec_start = esp_timer_get_time();
     ret = audio_in_record(pcm, num_samples, &actual);
-    audio_in_deinit();
 
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "audio_in_record failed: %s", esp_err_to_name(ret));
