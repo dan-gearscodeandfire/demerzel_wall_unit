@@ -17,6 +17,11 @@ server/env.local
 tests/audio/
 tests/rec_*.raw
 tests/rec_*.wav
+tests/.gui_record.log
+tests/.tmp_playback.wav
+
+# Session 45 wake-phrase audition samples (large, not used by current validation)
+wake_word_samples/
 
 # Firmware binaries (large, downloadable)
 firmware/*.bin

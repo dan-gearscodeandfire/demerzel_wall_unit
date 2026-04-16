@@ -1,0 +1,4 @@
+Drop hard-negative recordings here (16 kHz / 16-bit / mono, .wav or .raw).
+Suggested negatives: "hey dim the lights", "damsel", "Denzel", "dim cell",
+"then mural", "yo there", "demerit", "yo mama", plus 30+ seconds of
+background room noise / TV / conversation. Each should NOT fire the model.

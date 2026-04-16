@@ -1,0 +1,3 @@
+Drop "Yo Demerzel" recordings here (16 kHz / 16-bit / mono, .wav or .raw).
+Use tests/record_speech.py on the DWU, then `mpremote cp :speech.raw <name>.raw`.
+Each clip should contain ONE clear utterance of the wake phrase.
