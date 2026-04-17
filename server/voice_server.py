@@ -20,6 +20,7 @@ GET /health
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -76,11 +77,36 @@ def synthesize(text: str) -> bytes:
             pass
 
 
+_WHISPER_ANNOT_RE = re.compile(r"^\s*(?:[\[\(][^\]\)]*[\]\)]\s*)+$")
+
+def _is_routable_transcript(text: str) -> bool:
+    """Filter whisper output that isn't actually speech.
+
+    Whisper emits non-speech annotations for ambient sounds: `[BLANK_AUDIO]`,
+    `[SOUND]`, `[MUSIC]`, `(water running)`, `(clicking)`, etc. These can
+    happen any time the DWU records a turn with no real speech (e.g. false
+    wake-word trigger near running water or the TV). Without filtering, the
+    router happily hallucinates an intent from the annotation text and we
+    end up physically speaking a fabricated response.
+
+    Also reject transcripts with no alphabetic content (whisper occasionally
+    returns digit-dot sequences like "( ( 2. 3. 4." for non-speech audio).
+    """
+    if not text:
+        return False
+    if _WHISPER_ANNOT_RE.match(text):
+        return False
+    if not any(c.isalpha() for c in text):
+        return False
+    return True
+
+
 def stage2_pipeline(transcript: str) -> tuple[str, dict]:
     """Stage 2: route → dispatch → compose. Returns (spoken_text, debug_info)."""
     debug = {}
-    if not transcript:
-        return "I did not catch that.", {"reason": "empty_transcript"}
+    if not _is_routable_transcript(transcript):
+        log.info("dropping non-speech transcript: %r", transcript)
+        return "I did not catch that.", {"reason": "non_speech", "transcript": transcript}
 
     t0 = time.monotonic()
     decision = router_mod.route(transcript)
