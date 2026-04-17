@@ -38,6 +38,15 @@ static void beep(int freq_hz, int duration_ms, int rate)
     heap_caps_free(buf);
 }
 
+// Descending two-tone "something went wrong" pattern. Audible feedback for
+// any voice_turn error path (HTTP timeout, WAV parse, etc).
+static void beep_error(void)
+{
+    beep(600, 150, 16000);
+    vTaskDelay(pdMS_TO_TICKS(80));
+    beep(400, 250, 16000);
+}
+
 static const char *TAG = "voice_turn";
 
 #define RECORD_RATE    16000
@@ -63,6 +72,7 @@ esp_err_t voice_turn_execute(void)
     if (!pcm) {
         ESP_LOGE(TAG, "Failed to allocate PCM buffer (%u bytes)", (unsigned)(num_samples * 2));
         status_led_set(LED_RED);
+        beep_error();
         return ESP_ERR_NO_MEM;
     }
 
@@ -74,6 +84,7 @@ esp_err_t voice_turn_execute(void)
         ESP_LOGE(TAG, "audio_in_record failed: %s", esp_err_to_name(ret));
         heap_caps_free(pcm);
         status_led_set(LED_RED);
+        beep_error();
         return ret;
     }
 
@@ -95,6 +106,7 @@ esp_err_t voice_turn_execute(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "wav_wrap failed");
         status_led_set(LED_RED);
+        beep_error();
         return ret;
     }
 
@@ -109,6 +121,7 @@ esp_err_t voice_turn_execute(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "HTTP POST failed: %s", esp_err_to_name(ret));
         status_led_set(LED_RED);
+        beep_error();
         return ret;
     }
 
@@ -128,6 +141,7 @@ esp_err_t voice_turn_execute(void)
         ESP_LOGE(TAG, "Failed to parse response WAV");
         heap_caps_free(wav_out);
         status_led_set(LED_RED);
+        beep_error();
         return ret;
     }
 
@@ -136,6 +150,7 @@ esp_err_t voice_turn_execute(void)
         ESP_LOGE(TAG, "audio_out_init failed: %s", esp_err_to_name(ret));
         heap_caps_free(wav_out);
         status_led_set(LED_RED);
+        beep_error();
         return ret;
     }
 

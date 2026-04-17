@@ -80,10 +80,14 @@ esp_err_t http_post_voice_turn(const uint8_t *wav_data, size_t wav_len,
     snprintf(url, sizeof(url), "http://%s:%d/voice_turn",
              CONFIG_DWU_OKDEMERZEL_HOST, CONFIG_DWU_OKDEMERZEL_PORT);
 
+    // timeout_ms applies per network operation (connect, send, recv). A dead
+    // or hung server can still drag total wall time to ~3x this before we
+    // fully give up, but keep it tight enough that the user doesn't stare at
+    // a blue LED for minutes when okDemerzel crashes.
     esp_http_client_config_t config = {
         .url = url,
         .method = HTTP_METHOD_POST,
-        .timeout_ms = 60000,
+        .timeout_ms = 15000,
         .event_handler = http_event_handler,
         .user_data = &ctx,
         .buffer_size = 4096,

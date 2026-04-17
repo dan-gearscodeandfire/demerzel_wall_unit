@@ -29,13 +29,16 @@ static const char *TAG = "wake_word";
 
 namespace {
 
-constexpr size_t TENSOR_ARENA_BYTES = 256 * 1024;
+// Observed arena_used_bytes after AllocateTensors on yo_demerzel_v1 = 33840.
+// 64 KB gives a ~30 KB safety margin for model variations.
+constexpr size_t TENSOR_ARENA_BYTES = 64 * 1024;
 constexpr size_t MAX_FRAMES_PER_FEED = 128;  // 128 * 10 ms = 1.28 s of audio per call
 
-// Op set big enough for mixednet streaming variants. Keep this list minimal
-// to control binary size. If AllocateTensors fails with "Didn't find op for
-// builtin opcode X" — add op X here.
-constexpr int OP_RESOLVER_SIZE = 32;
+// The trained yo_demerzel_v1 model uses exactly these 13 ops (verified by
+// parsing the .tflite flatbuffer). If a future retrain adds new ops,
+// AllocateTensors will fail with "Didn't find op for builtin opcode X" —
+// add op X here and bump OP_RESOLVER_SIZE.
+constexpr int OP_RESOLVER_SIZE = 13;
 
 // Number of resource variables the model may use. Our model (yo_demerzel_v1,
 // mixednet streaming with internal state) has one VAR_HANDLE per streaming
@@ -114,37 +117,22 @@ esp_err_t wake_word_init(wake_word_frontend_id_t frontend)
         return ESP_ERR_INVALID_VERSION;
     }
 
+    // Exact op set used by yo_demerzel_v1.tflite (confirmed via flatbuffer
+    // inspection). Keep this list in sync with the model's OperatorCodes.
     static tflite::MicroMutableOpResolver<OP_RESOLVER_SIZE> resolver;
-    resolver.AddDepthwiseConv2D();
+    resolver.AddCallOnce();
+    resolver.AddVarHandle();
+    resolver.AddReshape();
+    resolver.AddReadVariable();
+    resolver.AddConcatenation();
+    resolver.AddStridedSlice();
+    resolver.AddAssignVariable();
     resolver.AddConv2D();
+    resolver.AddDepthwiseConv2D();
+    resolver.AddSplitV();
     resolver.AddFullyConnected();
     resolver.AddLogistic();
-    resolver.AddReshape();
-    resolver.AddAdd();
-    resolver.AddMul();
-    resolver.AddSub();
-    resolver.AddAveragePool2D();
-    resolver.AddMaxPool2D();
-    resolver.AddStridedSlice();
-    resolver.AddConcatenation();
     resolver.AddQuantize();
-    resolver.AddDequantize();
-    resolver.AddSoftmax();
-    resolver.AddPad();
-    resolver.AddMean();
-    resolver.AddRelu();
-    resolver.AddRelu6();
-    resolver.AddResizeNearestNeighbor();
-    resolver.AddResizeBilinear();
-    resolver.AddExpandDims();
-    resolver.AddSplit();
-    resolver.AddSplitV();
-    resolver.AddTranspose();
-    resolver.AddVarHandle();
-    resolver.AddReadVariable();
-    resolver.AddAssignVariable();
-    resolver.AddCallOnce();
-    resolver.AddTransposeConv();
 
     // Arena in DRAM (internal heap) — TFLM has had PSRAM alignment issues on
     // ESP32-S3, and 256 KB fits comfortably in internal heap.
