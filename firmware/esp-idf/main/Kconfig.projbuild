@@ -32,6 +32,24 @@ menu "DWU Configuration"
         int "Recording duration (seconds)"
         default 8
 
+    config DWU_FOLLOWUP_WINDOW_MS
+        int "Followup window duration (ms)"
+        default 5000
+
+    config DWU_FOLLOWUP_ENERGY_THRESHOLD
+        int "Speech energy threshold for followup (mean-square of int16)"
+        default 500000
+        help
+            Mean-square amplitude to declare speech during followup. Quiet room
+            floor is ~50k-200k; speech is typically 1M+. Start conservative.
+
+    config DWU_FOLLOWUP_DEBOUNCE_CHUNKS
+        int "Consecutive 10ms chunks above threshold to trigger"
+        default 8
+        help
+            Require this many consecutive chunks above the energy threshold
+            before declaring speech. 8 = 80ms. Prevents pops/clicks.
+
     config DWU_TEST_ALL_DRIVERS
         bool "Run all-driver self-test on boot"
         default n

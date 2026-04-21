@@ -9,6 +9,7 @@
 #include "audio_in.h"
 #include "audio_out.h"
 #include "wake_word_task.h"
+#include "followup.h"
 
 #include "nvs_flash.h"
 #include "esp_log.h"
@@ -234,24 +235,31 @@ void app_main(void)
             continue;
         }
 
-        // Pause wake-word inference while we record + play the turn.
-        // The task's own post-detect mute is timer-based and shorter than a
-        // full turn (~18 s), so without this our TTS playback would re-fire
-        // the wake word mid-response.
+        // Pause wake-word for the entire conversation chain (initial turn +
+        // any followup turns). Resume only when the chain ends.
         wake_word_task_pause();
-        ret = voice_turn_execute();
-        // Allow a brief settle + flush after playback before we listen again,
-        // so the tail of the TTS audio can't trip the wake word.
-        vTaskDelay(pdMS_TO_TICKS(500));
-        wake_word_task_resume();
 
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "voice_turn failed: %s", esp_err_to_name(ret));
-            status_led_set(LED_RED);
-            vTaskDelay(pdMS_TO_TICKS(2000));
+        bool do_turn = true;
+        while (do_turn) {
+            ret = voice_turn_execute();
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "voice_turn failed: %s", esp_err_to_name(ret));
+                status_led_set(LED_RED);
+                vTaskDelay(pdMS_TO_TICKS(2000));
+                break;
+            }
+
+            // Followup window — dim teal LED signals "still listening".
+            status_led_set_rgb(0, 40, 60);
+            do_turn = followup_detect_speech();
+            if (do_turn) {
+                ESP_LOGI(TAG, "Followup speech detected — another turn");
+            }
         }
 
         status_led_set(LED_OFF);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        wake_word_task_resume();
         log_heap_stats();
     }
 }
