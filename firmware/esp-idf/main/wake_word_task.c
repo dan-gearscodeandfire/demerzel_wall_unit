@@ -1,6 +1,8 @@
 #include "wake_word_task.h"
 #include "wake_word.h"
 #include "audio_in.h"
+#include "pir.h"
+#include "ld2410c.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -30,6 +32,29 @@ static atomic_uint        s_last_score     = 0;
 #define WARMUP_STEPS_AFTER_RESET 20
 static atomic_uint s_warmup_left = 0;
 
+// Presence holdoff: after any positive presence signal, consider the room
+// occupied for this long even if both sensors go quiet (handles brief
+// LD2410C dropout when a person is very still).
+#define PRESENCE_HOLDOFF_US  (30LL * 1000000LL)  // 30 seconds
+
+static bool check_room_occupied(int64_t *last_presence_us)
+{
+    bool pir = pir_get_state();
+
+    ld2410c_state_t ld;
+    bool radar = false;
+    if (ld2410c_get_state(&ld) == ESP_OK) {
+        radar = ld.presence;
+    }
+
+    int64_t now = esp_timer_get_time();
+    if (pir || radar) {
+        *last_presence_us = now;
+        return true;
+    }
+    return (now - *last_presence_us) < PRESENCE_HOLDOFF_US;
+}
+
 static void wake_word_task_fn(void *arg)
 {
     int16_t pcm[CHUNK_SAMPLES];
@@ -49,10 +74,24 @@ static void wake_word_task_fn(void *arg)
     int64_t  window_pcm_ms   = 0;     // sum of squares
     uint32_t window_samples  = 0;
     int64_t  last_log_us    = esp_timer_get_time();
+    int64_t  last_presence_us = esp_timer_get_time();  // assume occupied at boot
+    bool     was_occupied    = true;
 
     while (1) {
         size_t got = audio_in_consume_wake(pcm, CHUNK_SAMPLES, portMAX_DELAY);
         if (got == 0) continue;
+
+        // Presence gate: skip inference when nobody's in the room.
+        bool occupied = check_room_occupied(&last_presence_us);
+        if (occupied != was_occupied) {
+            ESP_LOGI(TAG, "room %s", occupied ? "OCCUPIED — wake-word active" : "EMPTY — inference suspended");
+            if (occupied) {
+                wake_word_reset();
+                atomic_store(&s_warmup_left, WARMUP_STEPS_AFTER_RESET);
+            }
+            was_occupied = occupied;
+        }
+        if (!occupied) continue;  // drain samples, skip inference
 
         // Track PCM peak + RMS for this heartbeat window.
         for (size_t i = 0; i < got; ++i) {
