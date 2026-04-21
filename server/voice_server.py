@@ -17,6 +17,7 @@ POST /voice_turn
 GET /health
     Returns {"status": "ok", ...}
 """
+import asyncio
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ import re
 import subprocess
 import tempfile
 import time
+import uuid
 import wave
 
 import requests
@@ -101,6 +103,50 @@ def _is_routable_transcript(text: str) -> bool:
     return True
 
 
+# --- Two-phase TTS: pending result store ---
+_pending: dict[str, dict] = {}
+PENDING_TTL = 120      # auto-cleanup stale entries after this many seconds
+PENDING_TIMEOUT = 30   # max seconds firmware will long-poll on /voice_result
+
+
+def _stage2_from_decision(transcript: str, decision: dict) -> tuple[str, dict]:
+    """Like stage2_pipeline but skips the router — decision already known."""
+    debug = {"router": decision}
+    t1 = time.monotonic()
+    tool_result = tools_mod.dispatch(decision["tool"], decision.get("params", {}))
+    debug["tool_ms"] = int((time.monotonic() - t1) * 1000)
+    debug["tool_result"] = tool_result[:500] if isinstance(tool_result, str) else str(tool_result)[:500]
+    t2 = time.monotonic()
+    spoken = composer_mod.compose(decision, tool_result, transcript)
+    debug["compose_ms"] = int((time.monotonic() - t2) * 1000)
+    return spoken, debug
+
+
+async def _slow_background(request_id: str, transcript: str, decision: dict):
+    """Run tool dispatch + compose + synthesize in background, store result."""
+    entry = _pending[request_id]
+    try:
+        loop = asyncio.get_event_loop()
+        reply, debug = await loop.run_in_executor(
+            None, _stage2_from_decision, transcript, decision
+        )
+        wav_out = await loop.run_in_executor(None, synthesize, reply)
+        entry["wav"] = wav_out
+        entry["reply_text"] = reply
+        entry["debug"] = debug
+    except Exception as e:
+        log.exception("background task failed for %s", request_id)
+        fallback = "Sorry, something went wrong."
+        try:
+            entry["wav"] = await loop.run_in_executor(None, synthesize, fallback)
+        except Exception:
+            entry["wav"] = b""
+        entry["reply_text"] = fallback
+        entry["error"] = str(e)
+    finally:
+        entry["event"].set()
+
+
 def stage2_pipeline(transcript: str) -> tuple[str, dict]:
     """Stage 2: route → dispatch → compose. Returns (spoken_text, debug_info)."""
     debug = {}
@@ -126,6 +172,10 @@ def stage2_pipeline(transcript: str) -> tuple[str, dict]:
     return spoken, debug
 
 
+def _hdr_safe(s: str) -> str:
+    return " ".join(s.split())[:500]
+
+
 async def voice_turn(request: web.Request) -> web.Response:
     t0 = time.monotonic()
     wav_in = await request.read()
@@ -138,12 +188,77 @@ async def voice_turn(request: web.Request) -> web.Response:
         return web.json_response({"error": "whisper_failed", "detail": str(e)}, status=500)
     log.info("transcript: %r", transcript)
 
+    # Filter non-speech
+    if not _is_routable_transcript(transcript):
+        log.info("dropping non-speech transcript: %r", transcript)
+        fallback = "I did not catch that."
+        try:
+            wav_out = synthesize(fallback)
+        except Exception:
+            return web.json_response({"error": "synth_failed"}, status=500)
+        return web.Response(
+            body=wav_out, content_type="audio/wav",
+            headers={
+                "X-Transcript": _hdr_safe(transcript),
+                "X-Reply-Text": _hdr_safe(fallback),
+                "X-Latency-Ms": str(int((time.monotonic() - t0) * 1000)),
+            },
+        )
+
+    # Route (fast: ~100-300 ms)
+    t_route = time.monotonic()
     try:
-        reply, debug = stage2_pipeline(transcript)
+        decision = router_mod.route(transcript)
+    except Exception as e:
+        log.exception("router failed")
+        decision = {"intent": "chat", "latency_class": "quick",
+                     "verbal_response": "answer_only", "tool": "llm_chat",
+                     "params": {"prompt": transcript}, "confidence": 0.0}
+    route_ms = int((time.monotonic() - t_route) * 1000)
+    log.info("router decision (%d ms): %s", route_ms,
+             json.dumps({k: v for k, v in decision.items() if k != "params"}))
+
+    # --- Two-phase: ack immediately for slow turns ---
+    if (decision.get("latency_class") == "slow"
+            and decision.get("verbal_response") == "acknowledge_first"):
+        ack_text = decision.get("ack_phrase") or "One moment."
+        log.info("two-phase: ack=%r, launching background task", ack_text)
+        try:
+            ack_wav = synthesize(ack_text)
+        except Exception:
+            log.exception("ack synth failed, falling back to single-phase")
+            ack_wav = None
+
+        if ack_wav:
+            request_id = uuid.uuid4().hex[:12]
+            _pending[request_id] = {
+                "event": asyncio.Event(),
+                "wav": None, "reply_text": None, "debug": None, "error": None,
+                "created": time.monotonic(),
+            }
+            asyncio.ensure_future(_slow_background(request_id, transcript, decision))
+
+            elapsed_ms = int((time.monotonic() - t0) * 1000)
+            return web.Response(
+                body=ack_wav, content_type="audio/wav",
+                headers={
+                    "X-Transcript": _hdr_safe(transcript),
+                    "X-Reply-Text": _hdr_safe(ack_text),
+                    "X-Latency-Ms": str(elapsed_ms),
+                    "X-DWU-Pending": request_id,
+                    "X-Router-Intent": _hdr_safe(str(decision.get("intent", ""))),
+                    "X-Router-Ms": str(route_ms),
+                },
+            )
+
+    # --- Single-phase: dispatch + compose + synthesize inline ---
+    try:
+        reply, debug = _stage2_from_decision(transcript, decision)
+        debug["router_ms"] = route_ms
     except Exception as e:
         log.exception("stage2 pipeline failed")
         reply = "Sorry, something went wrong."
-        debug = {"error": str(e)}
+        debug = {"error": str(e), "router_ms": route_ms}
     log.info("reply: %r", reply)
 
     try:
@@ -158,22 +273,17 @@ async def voice_turn(request: web.Request) -> web.Response:
     elapsed_ms = int((time.monotonic() - t0) * 1000)
     log.info("total %d ms, response %d bytes", elapsed_ms, len(wav_out))
 
-    def hdr_safe(s: str) -> str:
-        # Strip CR/LF/NUL and cap length so we never fail header serialization
-        return " ".join(s.split())[:500]
-
     headers = {
-        "X-Transcript": hdr_safe(transcript),
-        "X-Reply-Text": hdr_safe(reply),
+        "X-Transcript": _hdr_safe(transcript),
+        "X-Reply-Text": _hdr_safe(reply),
         "X-Latency-Ms": str(elapsed_ms),
     }
-    # Surface stage-2 routing decisions for debugging
     if debug.get("router"):
         d = debug["router"]
-        headers["X-Router-Model"] = hdr_safe(str(d.get("_router_model", "")))
-        headers["X-Router-Intent"] = hdr_safe(str(d.get("intent", "")))
-        headers["X-Router-Tool"] = hdr_safe(str(d.get("tool", "")))
-        headers["X-Router-Confidence"] = hdr_safe(str(d.get("confidence", "")))
+        headers["X-Router-Model"] = _hdr_safe(str(d.get("_router_model", "")))
+        headers["X-Router-Intent"] = _hdr_safe(str(d.get("intent", "")))
+        headers["X-Router-Tool"] = _hdr_safe(str(d.get("tool", "")))
+        headers["X-Router-Confidence"] = _hdr_safe(str(d.get("confidence", "")))
     if debug.get("router_ms") is not None:
         headers["X-Router-Ms"] = str(debug["router_ms"])
     if debug.get("tool_ms") is not None:
@@ -181,11 +291,35 @@ async def voice_turn(request: web.Request) -> web.Response:
     if debug.get("compose_ms") is not None:
         headers["X-Compose-Ms"] = str(debug["compose_ms"])
 
-    return web.Response(
-        body=wav_out,
-        content_type="audio/wav",
-        headers=headers,
-    )
+    return web.Response(body=wav_out, content_type="audio/wav", headers=headers)
+
+
+async def voice_result(request: web.Request) -> web.Response:
+    """Long-poll endpoint: firmware calls this to fetch the real answer after
+    receiving an ack WAV with X-DWU-Pending."""
+    request_id = request.match_info["request_id"]
+    entry = _pending.get(request_id)
+    if entry is None:
+        return web.json_response({"error": "not_found"}, status=404)
+
+    try:
+        await asyncio.wait_for(entry["event"].wait(), timeout=PENDING_TIMEOUT)
+    except asyncio.TimeoutError:
+        _pending.pop(request_id, None)
+        return web.json_response({"error": "timeout"}, status=504)
+
+    wav = entry.get("wav", b"")
+    reply_text = entry.get("reply_text", "")
+    debug = entry.get("debug") or {}
+    _pending.pop(request_id, None)
+
+    headers = {"X-Reply-Text": _hdr_safe(reply_text)}
+    if debug.get("tool_ms") is not None:
+        headers["X-Tool-Ms"] = str(debug["tool_ms"])
+    if debug.get("compose_ms") is not None:
+        headers["X-Compose-Ms"] = str(debug["compose_ms"])
+
+    return web.Response(body=wav, content_type="audio/wav", headers=headers)
 
 
 async def voice_text(request: web.Request) -> web.Response:
@@ -225,9 +359,27 @@ async def health(request: web.Request) -> web.Response:
     })
 
 
+async def _cleanup_pending(app):
+    """Periodically sweep stale pending entries (orphaned by firmware crash, etc)."""
+    while True:
+        await asyncio.sleep(30)
+        now = time.monotonic()
+        stale = [k for k, v in _pending.items() if now - v["created"] > PENDING_TTL]
+        for k in stale:
+            _pending.pop(k, None)
+        if stale:
+            log.info("cleaned %d stale pending entries", len(stale))
+
+
+async def on_startup(app):
+    asyncio.ensure_future(_cleanup_pending(app))
+
+
 def main():
     app = web.Application(client_max_size=10 * 1024 * 1024)  # 10 MB max upload
+    app.on_startup.append(on_startup)
     app.router.add_post("/voice_turn", voice_turn)
+    app.router.add_get("/voice_result/{request_id}", voice_result)
     app.router.add_post("/voice_text", voice_text)
     app.router.add_get("/health", health)
     log.info("starting on %s:%d", LISTEN_HOST, LISTEN_PORT)

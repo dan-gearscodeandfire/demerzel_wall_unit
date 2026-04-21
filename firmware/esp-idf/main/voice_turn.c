@@ -52,6 +52,32 @@ static const char *TAG = "voice_turn";
 #define RECORD_RATE    16000
 #define PLAYBACK_CHUNK 4096
 
+static esp_err_t play_wav(const uint8_t *wav, size_t wav_len)
+{
+    wav_header_info_t info;
+    esp_err_t ret = wav_parse(wav, wav_len, &info);
+    if (ret != ESP_OK) return ret;
+
+    ret = audio_out_init(info.sample_rate, info.bits_per_sample, info.channels);
+    if (ret != ESP_OK) return ret;
+
+    audio_out_unmute();
+    size_t pos = info.data_offset;
+    size_t end = info.data_offset + info.data_size;
+    if (end > wav_len) end = wav_len;
+
+    while (pos < end) {
+        size_t chunk = (end - pos > PLAYBACK_CHUNK) ? PLAYBACK_CHUNK : (end - pos);
+        size_t written;
+        audio_out_write(wav + pos, chunk, &written);
+        pos += written;
+    }
+
+    audio_out_mute();
+    audio_out_deinit();
+    return ESP_OK;
+}
+
 esp_err_t voice_turn_execute(void)
 {
     int64_t t_start = esp_timer_get_time();
@@ -131,45 +157,70 @@ esp_err_t voice_turn_execute(void)
     ESP_LOGI(TAG, "Replying: %s", meta.reply_text);
     ESP_LOGI(TAG, "Server:   %d ms", meta.latency_ms);
 
-    // Play response
-    status_led_set(LED_GREEN);
-    ESP_LOGI(TAG, "Playing response...");
+    // --- Play response (single-phase or two-phase) ---
 
-    wav_header_info_t wav_info;
-    ret = wav_parse(wav_out, wav_out_len, &wav_info);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to parse response WAV");
+    if (meta.pending_id[0] != '\0') {
+        // TWO-PHASE: play the ack first, then fetch + play the real answer.
+        ESP_LOGI(TAG, "Two-phase: playing ack (pending_id=%s)...", meta.pending_id);
+        status_led_set(LED_GREEN);
+        ret = play_wav(wav_out, wav_out_len);
         heap_caps_free(wav_out);
-        status_led_set(LED_RED);
-        beep_error();
-        return ret;
-    }
+        wav_out = NULL;
 
-    ret = audio_out_init(wav_info.sample_rate, wav_info.bits_per_sample, wav_info.channels);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "audio_out_init failed: %s", esp_err_to_name(ret));
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to play ack WAV");
+            status_led_set(LED_RED);
+            beep_error();
+            return ret;
+        }
+
+        // Fetch real answer (long-poll, blocks up to ~35 s).
+        status_led_set(LED_BLUE);
+        ESP_LOGI(TAG, "Fetching real answer for %s...", meta.pending_id);
+
+        uint8_t *real_wav = NULL;
+        size_t real_wav_len = 0;
+        voice_turn_meta_t real_meta;
+
+        int64_t t_fetch = esp_timer_get_time();
+        ret = http_get_voice_result(meta.pending_id, &real_wav, &real_wav_len, &real_meta);
+        int fetch_ms = (int)((esp_timer_get_time() - t_fetch) / 1000);
+
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to fetch real answer (%d ms): %s",
+                     fetch_ms, esp_err_to_name(ret));
+            status_led_set(LED_RED);
+            beep_error();
+            return ret;
+        }
+
+        ESP_LOGI(TAG, "Real answer: %d ms, %u bytes — %s",
+                 fetch_ms, (unsigned)real_wav_len, real_meta.reply_text);
+
+        status_led_set(LED_GREEN);
+        ret = play_wav(real_wav, real_wav_len);
+        heap_caps_free(real_wav);
+
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to play real answer WAV");
+            status_led_set(LED_RED);
+            beep_error();
+            return ret;
+        }
+    } else {
+        // SINGLE-PHASE: play the response directly.
+        status_led_set(LED_GREEN);
+        ESP_LOGI(TAG, "Playing response...");
+        ret = play_wav(wav_out, wav_out_len);
         heap_caps_free(wav_out);
-        status_led_set(LED_RED);
-        beep_error();
-        return ret;
+
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to play response WAV");
+            status_led_set(LED_RED);
+            beep_error();
+            return ret;
+        }
     }
-
-    audio_out_unmute();
-
-    size_t pos = wav_info.data_offset;
-    size_t end = wav_info.data_offset + wav_info.data_size;
-    if (end > wav_out_len) end = wav_out_len;
-
-    while (pos < end) {
-        size_t chunk = (end - pos > PLAYBACK_CHUNK) ? PLAYBACK_CHUNK : (end - pos);
-        size_t written;
-        audio_out_write(wav_out + pos, chunk, &written);
-        pos += written;
-    }
-
-    audio_out_mute();
-    audio_out_deinit();
-    heap_caps_free(wav_out);
 
     status_led_set(LED_OFF);
 

@@ -14,12 +14,14 @@ bool followup_detect_speech(void)
     int16_t pcm[CHUNK_SAMPLES];
 
     // Flush stale samples (TTS bleed-through sitting in the wake ring).
-    for (int i = 0; i < 30; i++) {
+    for (int i = 0; i < 100; i++) {
         if (audio_in_consume_wake(pcm, CHUNK_SAMPLES, 0) == 0) break;
     }
 
-    // Settling delay — let the speaker amp go quiet + mic echo decay.
-    vTaskDelay(pdMS_TO_TICKS(200));
+    // Settling delay — the speaker amp + room acoustics need ~1 s to go
+    // quiet after TTS playback. Without this, the followup detector picks
+    // up the tail of the just-played response and loops endlessly.
+    vTaskDelay(pdMS_TO_TICKS(1000));
     while (audio_in_consume_wake(pcm, CHUNK_SAMPLES, 0) > 0) {}
 
     ESP_LOGI(TAG, "followup window open (%d ms, threshold=%d, debounce=%d)",
