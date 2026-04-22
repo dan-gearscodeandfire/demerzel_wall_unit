@@ -22,6 +22,14 @@ static const char *TAG = "ws_client";
 // (1280) plus slack. Static to avoid heap churn in the hot path.
 #define TTS_DECODE_BUF_BYTES 2048
 
+// Frame-assembly buffer for multi-part WEBSOCKET_EVENT_DATA events. The
+// esp_websocket_client delivers a single WS frame as multiple events when
+// the frame crosses its internal read boundary — observed splitting at odd
+// offsets like 389/1396. Without assembly the handler parses each fragment
+// as independent JSON, which fails ("bad JSON from server" with dropped
+// chunks). 4 KB covers any tts_chunk frame (~1760 B) with margin.
+#define RX_ASSEMBLY_BYTES 4096
+
 static esp_websocket_client_handle_t s_client = NULL;
 static EventGroupHandle_t s_events = NULL;
 static SemaphoreHandle_t s_expect_mutex = NULL;
@@ -33,6 +41,10 @@ static char s_expect_tts_request_id[16]; // tts stream id the voice turn wants
 static ws_tts_handler_t s_tts_handler = NULL;
 static void *s_tts_handler_ctx = NULL;
 static uint8_t s_tts_decode_buf[TTS_DECODE_BUF_BYTES];
+
+static uint8_t s_rx_assembly[RX_ASSEMBLY_BYTES];
+static size_t  s_rx_assembly_len = 0;
+static int     s_rx_expected_len = 0;     // -1 if unknown
 
 static void _send_hello(void)
 {
@@ -182,8 +194,37 @@ static void _ws_event_handler(void *arg, esp_event_base_t base,
             ESP_LOGW(TAG, "disconnected");
             break;
         case WEBSOCKET_EVENT_DATA:
-            if (d->op_code == 0x01 /* TEXT */ && d->data_len > 0) {
-                _handle_server_event((const char *)d->data_ptr, d->data_len);
+            if ((d->op_code == 0x01 /* TEXT */ || d->op_code == 0x00 /* CONT */)
+                    && d->data_len > 0) {
+                // New WS frame starts at payload_offset=0. Reset assembly.
+                if (d->payload_offset == 0) {
+                    s_rx_assembly_len = 0;
+                    s_rx_expected_len = d->payload_len;  // may be -1 if unknown
+                }
+                // Append current fragment.
+                if (s_rx_assembly_len + d->data_len <= sizeof(s_rx_assembly)) {
+                    memcpy(s_rx_assembly + s_rx_assembly_len,
+                            d->data_ptr, d->data_len);
+                    s_rx_assembly_len += d->data_len;
+                } else {
+                    ESP_LOGW(TAG, "rx assembly overflow (%u+%u > %u), dropping",
+                             (unsigned)s_rx_assembly_len, (unsigned)d->data_len,
+                             (unsigned)sizeof(s_rx_assembly));
+                    s_rx_assembly_len = 0;
+                    s_rx_expected_len = 0;
+                    break;
+                }
+                // Parse when the frame is complete. If payload_len was
+                // unknown, assume each delivery is a complete frame (old
+                // behavior).
+                bool complete = (s_rx_expected_len <= 0) ||
+                                ((int)s_rx_assembly_len >= s_rx_expected_len);
+                if (complete) {
+                    _handle_server_event((const char *)s_rx_assembly,
+                                          s_rx_assembly_len);
+                    s_rx_assembly_len = 0;
+                    s_rx_expected_len = 0;
+                }
             }
             break;
         case WEBSOCKET_EVENT_ERROR:
@@ -226,8 +267,12 @@ esp_err_t ws_client_start(const char *fw_version)
         .ping_interval_sec = 30,
         .pingpong_timeout_sec = 20,
         // tts_chunk frames carry ~1708 chars of base64-encoded PCM plus the
-        // JSON envelope (~1760 bytes total). 4096 gives comfortable headroom.
-        .buffer_size = 4096,
+        // JSON envelope (~1760 bytes total). Observed fragmentation at 4096
+        // during back-to-back burst of 55+ frames — rx would split a frame
+        // and we'd see "bad JSON" warnings as fragments arrived separately.
+        // 8192 gives comfortable margin for 2+ frames-per-buffer without
+        // forcing assembly logic in _handle_server_event.
+        .buffer_size = 8192,
     };
 
     s_client = esp_websocket_client_init(&cfg);

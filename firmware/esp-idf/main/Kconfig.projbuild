@@ -51,15 +51,18 @@ menu "DWU Configuration"
             Require this many consecutive chunks above the energy threshold
             before declaring speech. 8 = 80ms. Prevents pops/clicks.
 
-    config DWU_TTS_JITTER_MS
-        int "Streaming TTS jitter buffer (ms)"
-        default 200
+    config DWU_TTS_RING_KB
+        int "Streaming TTS ring buffer size (KB)"
+        default 128
         help
-            Size of the PCM ring buffer between the ws_client tts_chunk
-            handler and the I2S writer task. Larger = more immune to WiFi
-            jitter, smaller = faster response to server underruns. 200 ms
-            is the comfortable default; drop to 100 if LAN latency is stable
-            or bump to 300 if you see underrun warnings in the TCP log.
+            SPIRAM ring that the ws_client tts_chunk handler pushes into and
+            the audio_out writer task drains from. Must hold the ENTIRE
+            reply PCM during the pre-activation window (while the ack WAV
+            is still playing and the writer task has not yet started) —
+            the server pushes all chunks in a burst as soon as synthesis
+            completes. 128 KB = ~4 s of 16 kHz mono int16, comfortable for
+            a typical multi-sentence slow-class reply. Bump to 256 if you
+            see "stream_push dropped" warnings on long responses.
 
     config DWU_TEST_ALL_DRIVERS
         bool "Run all-driver self-test on boot"

@@ -19,9 +19,21 @@ static const char *TAG = "audio_out";
 static i2s_chan_handle_t tx_chan = NULL;
 
 // --- Streaming session state ---
-static StreamBufferHandle_t s_stream = NULL;
+// Lifecycle flags are separate: _active means "buffer exists" (begin→end);
+// _draining means "writer task is live" (activate→end). Between begin and
+// activate, producers can push into the ring while ack playback still owns
+// I2S.
+//
+// StreamBuffer is created statically with a PSRAM-allocated storage area.
+// The default xStreamBufferCreate path allocates from the internal-RAM heap
+// which is too tight for 128 KB of PCM buffering alongside the rest of
+// the runtime — so we explicitly route the big buffer to SPIRAM.
+static StreamBufferHandle_t  s_stream = NULL;
+static StaticStreamBuffer_t  s_stream_static;   // control struct
+static uint8_t              *s_stream_storage = NULL;  // PSRAM-alloc'd
 static TaskHandle_t          s_writer_task = NULL;
 static volatile bool         s_stream_active = false;
+static volatile bool         s_stream_draining = false;
 static volatile bool         s_stream_stop_request = false;
 static uint32_t              s_stream_sample_rate = 0;
 static uint8_t               s_stream_bits = 16;
@@ -208,54 +220,48 @@ static void _writer_task(void *arg)
 }
 
 esp_err_t audio_out_stream_begin(uint32_t sample_rate, uint8_t bits_per_sample,
-                                 uint8_t channels, size_t jitter_bytes)
+                                 uint8_t channels, size_t ring_bytes)
 {
     if (s_stream_active) return ESP_ERR_INVALID_STATE;
-    if (jitter_bytes < 1024) jitter_bytes = 1024;
+    if (ring_bytes < 1024) ring_bytes = 1024;
 
-    // A StreamBuffer's trigger level controls when Receive wakes; we set 1 so
-    // any arrival unblocks us promptly.
-    s_stream = xStreamBufferCreate(jitter_bytes, 1);
-    if (!s_stream) return ESP_ERR_NO_MEM;
+    // Storage goes in SPIRAM — 128 KB in internal SRAM is too much to ask
+    // alongside WiFi, TFLM wake-word arena, and the rest of the runtime.
+    s_stream_storage = heap_caps_malloc(ring_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_stream_storage) {
+        ESP_LOGE(TAG, "stream_begin: PSRAM alloc of %u bytes failed",
+                 (unsigned)ring_bytes);
+        return ESP_ERR_NO_MEM;
+    }
+
+    // Trigger level 1 = any arrival unblocks the writer task receive.
+    s_stream = xStreamBufferCreateStatic(ring_bytes, 1,
+                                          s_stream_storage, &s_stream_static);
+    if (!s_stream) {
+        heap_caps_free(s_stream_storage);
+        s_stream_storage = NULL;
+        return ESP_ERR_NO_MEM;
+    }
 
     s_drain_done = xSemaphoreCreateBinary();
     if (!s_drain_done) {
         vStreamBufferDelete(s_stream);
         s_stream = NULL;
+        heap_caps_free(s_stream_storage);
+        s_stream_storage = NULL;
         return ESP_ERR_NO_MEM;
     }
-
-    esp_err_t ret = audio_out_init(sample_rate, bits_per_sample, channels);
-    if (ret != ESP_OK) {
-        vStreamBufferDelete(s_stream);
-        vSemaphoreDelete(s_drain_done);
-        s_stream = NULL;
-        s_drain_done = NULL;
-        return ret;
-    }
-    audio_out_unmute();
 
     s_stream_sample_rate = sample_rate;
     s_stream_bits = bits_per_sample;
     s_stream_channels = channels;
     s_stream_stop_request = false;
+    s_stream_draining = false;
     s_underrun_count = 0;
     s_stream_active = true;
 
-    BaseType_t ok = xTaskCreatePinnedToCore(_writer_task, "audio_stream_wr",
-                                             4096, NULL, 10, &s_writer_task, 1);
-    if (ok != pdPASS) {
-        s_stream_active = false;
-        audio_out_deinit();
-        vStreamBufferDelete(s_stream);
-        vSemaphoreDelete(s_drain_done);
-        s_stream = NULL;
-        s_drain_done = NULL;
-        return ESP_ERR_NO_MEM;
-    }
-
-    ESP_LOGI(TAG, "stream begin: %lu Hz %u-bit %u ch, jitter=%u bytes",
-             sample_rate, bits_per_sample, channels, (unsigned)jitter_bytes);
+    ESP_LOGI(TAG, "stream begin: %lu Hz %u-bit %u ch, ring=%u bytes (buffer only, I2S idle)",
+             sample_rate, bits_per_sample, channels, (unsigned)ring_bytes);
     return ESP_OK;
 }
 
@@ -271,41 +277,82 @@ esp_err_t audio_out_stream_push(const void *pcm, size_t len,
     return ESP_OK;
 }
 
+esp_err_t audio_out_stream_activate(void)
+{
+    if (!s_stream_active) return ESP_ERR_INVALID_STATE;
+    if (s_stream_draining) return ESP_ERR_INVALID_STATE;
+
+    esp_err_t ret = audio_out_init(s_stream_sample_rate, s_stream_bits,
+                                   s_stream_channels);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "stream_activate: audio_out_init failed: %s",
+                 esp_err_to_name(ret));
+        return ret;
+    }
+    audio_out_unmute();
+
+    s_stream_draining = true;
+
+    BaseType_t ok = xTaskCreatePinnedToCore(_writer_task, "audio_stream_wr",
+                                             4096, NULL, 10, &s_writer_task, 1);
+    if (ok != pdPASS) {
+        s_stream_draining = false;
+        audio_out_deinit();
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t prebuffered = xStreamBufferBytesAvailable(s_stream);
+    ESP_LOGI(TAG, "stream activate: writer live, %u bytes pre-buffered",
+             (unsigned)prebuffered);
+    return ESP_OK;
+}
+
 esp_err_t audio_out_stream_end(TickType_t drain_timeout_ticks)
 {
     if (!s_stream_active) return ESP_ERR_INVALID_STATE;
 
     s_stream_stop_request = true;
 
-    // Block until the writer task exits (or timeout — in which case it's still
-    // running but we proceed with teardown, which will be ugly but bounded).
-    BaseType_t ok = xSemaphoreTake(s_drain_done, drain_timeout_ticks);
-    if (ok != pdTRUE) {
-        ESP_LOGW(TAG, "stream_end: writer didn't drain in %lu ms",
-                 (unsigned long)(drain_timeout_ticks * portTICK_PERIOD_MS));
+    if (s_stream_draining) {
+        // Block until the writer task exits (or timeout — in which case it's
+        // still running but we proceed with teardown, which will be ugly but
+        // bounded).
+        BaseType_t ok = xSemaphoreTake(s_drain_done, drain_timeout_ticks);
+        if (ok != pdTRUE) {
+            ESP_LOGW(TAG, "stream_end: writer didn't drain in %lu ms",
+                     (unsigned long)(drain_timeout_ticks * portTICK_PERIOD_MS));
+        }
+        // Short delay to let the last DMA descriptors flush through the amp.
+        vTaskDelay(pdMS_TO_TICKS(50));
+        audio_out_mute();
+        audio_out_deinit();
+        s_stream_draining = false;
     }
 
     s_stream_active = false;
     if (s_stream) {
-        vStreamBufferDelete(s_stream);
+        vStreamBufferDelete(s_stream);  // static buffers: no-op on storage
         s_stream = NULL;
+    }
+    if (s_stream_storage) {
+        heap_caps_free(s_stream_storage);
+        s_stream_storage = NULL;
     }
     if (s_drain_done) {
         vSemaphoreDelete(s_drain_done);
         s_drain_done = NULL;
     }
-
-    // Short delay to let the last DMA descriptors flush through the amp.
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    audio_out_mute();
-    audio_out_deinit();
     return ESP_OK;
 }
 
 bool audio_out_stream_is_active(void)
 {
     return s_stream_active;
+}
+
+bool audio_out_stream_is_draining(void)
+{
+    return s_stream_draining;
 }
 
 uint32_t audio_out_stream_underrun_count(void)

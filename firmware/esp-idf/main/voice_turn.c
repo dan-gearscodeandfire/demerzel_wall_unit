@@ -54,16 +54,21 @@ static const char *TAG = "voice_turn";
 #define RECORD_RATE    16000
 #define PLAYBACK_CHUNK 4096
 
-// Jitter buffer for streaming TTS playback. 200 ms at 16 kHz mono int16 =
-// 6400 bytes. Kconfig override lands in Kconfig.projbuild.
-#ifndef CONFIG_DWU_TTS_JITTER_MS
-#define CONFIG_DWU_TTS_JITTER_MS 200
+// Streaming ring size. The server pushes all tts_chunks in a burst as soon
+// as synthesis completes — typically during ack WAV playback, which still
+// owns the I2S peripheral. The ring has to hold the entire reply until
+// voice_turn calls audio_out_stream_activate() after play_wav(ack) returns.
+// 128 KB = 4 s of 16 kHz mono int16 — comfortable margin for a typical
+// multi-sentence slow-class reply. Kconfig override lands in Kconfig.projbuild.
+#ifndef CONFIG_DWU_TTS_RING_KB
+#define CONFIG_DWU_TTS_RING_KB 128
 #endif
 
-// Streaming TTS handler state — only one turn streams at a time, so plain
+// Streaming TTS handler state. Only one turn streams at a time, so plain
 // statics suffice. The handler runs on the ws_client event-handler task and
-// must not block; audio_out_stream_push is a StreamBuffer send.
-static bool       s_tts_stream_opened = false;
+// must not block — audio_out_stream_begin/push are non-blocking ring ops.
+// The actual I2S + writer task spin up is deferred to voice_turn (stream
+// activate) after ack WAV playback releases the peripheral.
 static SemaphoreHandle_t s_tts_registered_mutex = NULL;
 
 static void _tts_stream_handler(const ws_tts_event_t *evt, void *ctx)
@@ -72,46 +77,43 @@ static void _tts_stream_handler(const ws_tts_event_t *evt, void *ctx)
     esp_err_t ret;
     switch (evt->type) {
     case WS_TTS_EVT_START: {
-        if (s_tts_stream_opened) {
-            ESP_LOGW(TAG, "tts_start but stream already open — tearing down");
+        if (audio_out_stream_is_active()) {
+            // Stale session from a prior turn that was never cleaned up.
+            // Wipe and start fresh.
+            ESP_LOGW(TAG, "tts_start while prior stream still active — resetting");
             audio_out_stream_end(pdMS_TO_TICKS(100));
-            s_tts_stream_opened = false;
         }
-        size_t jitter = (evt->sample_rate * CONFIG_DWU_TTS_JITTER_MS / 1000)
-                        * 2 /* int16 */ * evt->channels;
+        size_t ring_bytes = CONFIG_DWU_TTS_RING_KB * 1024;
         ret = audio_out_stream_begin((uint32_t)evt->sample_rate, 16,
-                                     (uint8_t)evt->channels, jitter);
+                                     (uint8_t)evt->channels, ring_bytes);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "audio_out_stream_begin failed: %s",
                      esp_err_to_name(ret));
             return;
         }
-        s_tts_stream_opened = true;
         break;
     }
     case WS_TTS_EVT_CHUNK: {
-        if (!s_tts_stream_opened) {
+        if (!audio_out_stream_is_active()) {
             ESP_LOGW(TAG, "tts_chunk before tts_start, dropping");
             return;
         }
-        // Short timeout: if the ring is full we'd rather drop this chunk and
-        // log an underflow than block the ws event task (which would stop
-        // processing subsequent frames). In practice the ring + writer keep
-        // up with a 16 kHz stream trivially.
-        ret = audio_out_stream_push(evt->pcm, evt->pcm_len, pdMS_TO_TICKS(100));
+        // During pre-activation accumulation, push must succeed — the ring
+        // is sized to hold the whole reply. Timeout > 0 so a momentary full
+        // buffer (e.g. ring almost drained under activate race) retries.
+        ret = audio_out_stream_push(evt->pcm, evt->pcm_len, pdMS_TO_TICKS(500));
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "stream_push dropped seq=%d (%u bytes): %s",
+            ESP_LOGW(TAG, "stream_push dropped seq=%d (%u bytes): %s — "
+                          "ring may be undersized",
                      evt->seq, (unsigned)evt->pcm_len, esp_err_to_name(ret));
         }
         break;
     }
     case WS_TTS_EVT_END: {
-        if (!s_tts_stream_opened) return;
-        ret = audio_out_stream_end(pdMS_TO_TICKS(5000));
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "stream_end returned %s", esp_err_to_name(ret));
-        }
-        s_tts_stream_opened = false;
+        // Don't tear down here — voice_turn owns the teardown so it can wait
+        // for the drain. We've already produced everything; the writer task
+        // (started by stream_activate) will empty the ring and exit via
+        // stream_end.
         break;
     }
     }
@@ -264,29 +266,67 @@ esp_err_t voice_turn_execute(void)
             status_led_set(LED_RED);
             beep_error();
             ws_client_expect_tts_stream(NULL);
+            if (audio_out_stream_is_active()) {
+                audio_out_stream_end(pdMS_TO_TICKS(200));
+            }
             return ret;
         }
 
-        // Wait for tts_end to fire (stream handler drains audio_out in
-        // parallel). Typical completion within 1-3 s of ack end for a
-        // multi-sentence reply. Hard cap of 35 s for the pathological slow
-        // case.
+        // Ack has released the I2S peripheral. If tts_start arrived during
+        // ack (the common case — server bursts all chunks into the ring
+        // while synthesis happens in parallel with ack playback), activate
+        // now and the writer task will immediately drain the pre-buffered
+        // PCM into I2S.
+        bool activated = false;
+        if (audio_out_stream_is_active()) {
+            esp_err_t act_ret = audio_out_stream_activate();
+            if (act_ret != ESP_OK) {
+                ESP_LOGW(TAG, "stream_activate failed: %s — falling back",
+                         esp_err_to_name(act_ret));
+                audio_out_stream_end(pdMS_TO_TICKS(200));
+            } else {
+                activated = true;
+                status_led_set(LED_GREEN);
+                ws_client_send_state("playing", meta.pending_id);
+            }
+        } else {
+            ESP_LOGI(TAG, "no tts_start yet, will wait on tts_end or fall back");
+        }
+
+        // Wait for tts_end to signal all chunks have been pushed. Hard cap
+        // of 35 s for the pathological slow case. Writer task is draining
+        // in parallel.
         int64_t t_stream_wait = esp_timer_get_time();
         esp_err_t stream_ret = ws_client_wait_tts_end(35000);
         int stream_ms = (int)((esp_timer_get_time() - t_stream_wait) / 1000);
 
-        if (stream_ret == ESP_OK) {
-            ESP_LOGI(TAG, "Real answer streamed over WS (wait=%d ms, underruns=%lu)",
-                     stream_ms,
-                     (unsigned long)audio_out_stream_underrun_count());
-        } else {
-            // Stream didn't complete — clear expectation and fall back to HTTP.
-            ws_client_expect_tts_stream(NULL);
-            if (s_tts_stream_opened) {
-                audio_out_stream_end(pdMS_TO_TICKS(500));
-                s_tts_stream_opened = false;
+        // If tts_start came LATE (after the wait started but before tts_end),
+        // audio_out_stream_is_active is now true but draining isn't — activate now.
+        if (stream_ret == ESP_OK && !activated && audio_out_stream_is_active()) {
+            esp_err_t act_ret = audio_out_stream_activate();
+            if (act_ret == ESP_OK) {
+                activated = true;
+                status_led_set(LED_GREEN);
+                ws_client_send_state("playing", meta.pending_id);
             }
-            ESP_LOGW(TAG, "TTS stream timed out after %d ms, falling back to GET /voice_result",
+        }
+
+        if (stream_ret == ESP_OK && activated) {
+            // Block until the writer drains the remaining ring.
+            esp_err_t end_ret = audio_out_stream_end(pdMS_TO_TICKS(15000));
+            uint32_t underruns = audio_out_stream_underrun_count();
+            ESP_LOGI(TAG, "Real answer streamed over WS (wait=%d ms, underruns=%lu, end=%s)",
+                     stream_ms, (unsigned long)underruns,
+                     esp_err_to_name(end_ret));
+        } else {
+            // Stream didn't complete in time (or tts_start never arrived) —
+            // tear down any half-open stream and fall back to HTTP.
+            ws_client_expect_tts_stream(NULL);
+            if (audio_out_stream_is_active()) {
+                audio_out_stream_end(pdMS_TO_TICKS(500));
+            }
+            ESP_LOGW(TAG, "TTS stream %s after %d ms, falling back to GET /voice_result",
+                     (stream_ret == ESP_OK) ? "couldn't activate" : "timed out",
                      stream_ms);
 
             status_led_set(LED_BLUE);
