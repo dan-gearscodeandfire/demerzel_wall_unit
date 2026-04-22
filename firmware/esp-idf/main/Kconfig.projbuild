@@ -106,12 +106,16 @@ menu "DWU Configuration"
         default 5000
 
     config DWU_FOLLOWUP_ENERGY_THRESHOLD
-        int "Speech energy threshold for followup (mean-square of int16)"
-        default 100000000
+        int "Minimum speech energy threshold for followup (floor)"
+        default 30000000
         help
-            Mean-square amplitude to declare speech during followup. Observed
-            values: quiet room 6-30M, ambient chatter 60-250M, direct speech
-            into mic 100-350M. Default 100M avoids ambient triggers.
+            Floor for the adaptive followup threshold. Per-turn, followup.c
+            measures baseline during a 200 ms calibration window right after
+            the 1 s settle delay, then uses max(baseline * 3, this value,
+            30 M) as the speech threshold. Observed values: quiet room
+            6-30 M, ambient chatter 60-250 M, direct speech into mic
+            100-350 M. Bump this up for environments where you want
+            followup to require louder speech regardless of ambient.
 
     config DWU_FOLLOWUP_DEBOUNCE_CHUNKS
         int "Consecutive 10ms chunks above threshold to trigger"
