@@ -39,3 +39,46 @@ esp_err_t ws_client_send_presence(bool pir, bool radar);
 
 void      ws_client_expect_pending_ready(const char *request_id);
 esp_err_t ws_client_wait_pending_ready(uint32_t timeout_ms);
+
+// --- TTS streaming ---
+//
+// Server emits `tts_start` → `tts_chunk` × N → `tts_end` on the same WS
+// channel for slow-class turns. The handler set here is called synchronously
+// from the ws task when each event arrives — it MUST be fast (no blocking
+// I/O, no long malloc). Typical implementation: push decoded PCM into an
+// audio_out ring and return.
+//
+// Lifetime: register a handler once at startup; use _expect_tts_stream(id)
+// per turn to gate which request_ids are surfaced. Events for non-expected
+// request_ids are silently dropped at the ws layer (no handler call).
+// Clear expectation with NULL/"".
+
+typedef enum {
+    WS_TTS_EVT_START,   // (sample_rate, channels)
+    WS_TTS_EVT_CHUNK,   // (pcm, pcm_len, seq)
+    WS_TTS_EVT_END,     // (total_seq)
+} ws_tts_event_type_t;
+
+typedef struct {
+    ws_tts_event_type_t type;
+    const char *request_id;   // borrowed, valid during callback only
+    // START:
+    int sample_rate;
+    int channels;
+    // CHUNK:
+    const uint8_t *pcm;       // decoded int16 LE PCM; borrowed for callback
+    size_t pcm_len;
+    int seq;
+    // END:
+    int total_seq;
+} ws_tts_event_t;
+
+typedef void (*ws_tts_handler_t)(const ws_tts_event_t *evt, void *ctx);
+
+void      ws_client_set_tts_handler(ws_tts_handler_t handler, void *ctx);
+void      ws_client_expect_tts_stream(const char *request_id);
+
+// Block until a matching `tts_end` fires or timeout elapses. Returns ESP_OK
+// when stream completed, ESP_ERR_TIMEOUT otherwise. Clears the expectation
+// on return.
+esp_err_t ws_client_wait_tts_end(uint32_t timeout_ms);

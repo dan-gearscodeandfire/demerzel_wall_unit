@@ -51,6 +51,16 @@ menu "DWU Configuration"
             Require this many consecutive chunks above the energy threshold
             before declaring speech. 8 = 80ms. Prevents pops/clicks.
 
+    config DWU_TTS_JITTER_MS
+        int "Streaming TTS jitter buffer (ms)"
+        default 200
+        help
+            Size of the PCM ring buffer between the ws_client tts_chunk
+            handler and the I2S writer task. Larger = more immune to WiFi
+            jitter, smaller = faster response to server underruns. 200 ms
+            is the comfortable default; drop to 100 if LAN latency is stable
+            or bump to 300 if you see underrun warnings in the TCP log.
+
     config DWU_TEST_ALL_DRIVERS
         bool "Run all-driver self-test on boot"
         default n

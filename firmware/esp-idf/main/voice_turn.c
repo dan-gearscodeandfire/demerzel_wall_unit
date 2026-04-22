@@ -9,6 +9,7 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include <math.h>
 
@@ -52,6 +53,84 @@ static const char *TAG = "voice_turn";
 
 #define RECORD_RATE    16000
 #define PLAYBACK_CHUNK 4096
+
+// Jitter buffer for streaming TTS playback. 200 ms at 16 kHz mono int16 =
+// 6400 bytes. Kconfig override lands in Kconfig.projbuild.
+#ifndef CONFIG_DWU_TTS_JITTER_MS
+#define CONFIG_DWU_TTS_JITTER_MS 200
+#endif
+
+// Streaming TTS handler state — only one turn streams at a time, so plain
+// statics suffice. The handler runs on the ws_client event-handler task and
+// must not block; audio_out_stream_push is a StreamBuffer send.
+static bool       s_tts_stream_opened = false;
+static SemaphoreHandle_t s_tts_registered_mutex = NULL;
+
+static void _tts_stream_handler(const ws_tts_event_t *evt, void *ctx)
+{
+    (void)ctx;
+    esp_err_t ret;
+    switch (evt->type) {
+    case WS_TTS_EVT_START: {
+        if (s_tts_stream_opened) {
+            ESP_LOGW(TAG, "tts_start but stream already open — tearing down");
+            audio_out_stream_end(pdMS_TO_TICKS(100));
+            s_tts_stream_opened = false;
+        }
+        size_t jitter = (evt->sample_rate * CONFIG_DWU_TTS_JITTER_MS / 1000)
+                        * 2 /* int16 */ * evt->channels;
+        ret = audio_out_stream_begin((uint32_t)evt->sample_rate, 16,
+                                     (uint8_t)evt->channels, jitter);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "audio_out_stream_begin failed: %s",
+                     esp_err_to_name(ret));
+            return;
+        }
+        s_tts_stream_opened = true;
+        break;
+    }
+    case WS_TTS_EVT_CHUNK: {
+        if (!s_tts_stream_opened) {
+            ESP_LOGW(TAG, "tts_chunk before tts_start, dropping");
+            return;
+        }
+        // Short timeout: if the ring is full we'd rather drop this chunk and
+        // log an underflow than block the ws event task (which would stop
+        // processing subsequent frames). In practice the ring + writer keep
+        // up with a 16 kHz stream trivially.
+        ret = audio_out_stream_push(evt->pcm, evt->pcm_len, pdMS_TO_TICKS(100));
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "stream_push dropped seq=%d (%u bytes): %s",
+                     evt->seq, (unsigned)evt->pcm_len, esp_err_to_name(ret));
+        }
+        break;
+    }
+    case WS_TTS_EVT_END: {
+        if (!s_tts_stream_opened) return;
+        ret = audio_out_stream_end(pdMS_TO_TICKS(5000));
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "stream_end returned %s", esp_err_to_name(ret));
+        }
+        s_tts_stream_opened = false;
+        break;
+    }
+    }
+}
+
+// Register the TTS stream handler once. Called at the first two-phase turn.
+static void _ensure_tts_handler_registered(void)
+{
+    if (!s_tts_registered_mutex) {
+        s_tts_registered_mutex = xSemaphoreCreateMutex();
+    }
+    static bool registered = false;
+    xSemaphoreTake(s_tts_registered_mutex, portMAX_DELAY);
+    if (!registered) {
+        ws_client_set_tts_handler(_tts_stream_handler, NULL);
+        registered = true;
+    }
+    xSemaphoreGive(s_tts_registered_mutex);
+}
 
 static esp_err_t play_wav(const uint8_t *wav, size_t wav_len)
 {
@@ -163,11 +242,17 @@ esp_err_t voice_turn_execute(void)
     // --- Play response (single-phase or two-phase) ---
 
     if (meta.pending_id[0] != '\0') {
-        // TWO-PHASE: play the ack first, then fetch + play the real answer.
+        // TWO-PHASE: play the ack first, then either stream the real answer
+        // over WS (fast path) or fall back to GET /voice_result (compat path).
         ESP_LOGI(TAG, "Two-phase: playing ack (pending_id=%s)...", meta.pending_id);
-        // Arm WS expectation BEFORE playing the ack — server may finish
-        // synthesis during ack playback and push pending_ready immediately.
+
+        // Arm both TTS streaming AND pending_ready expectations BEFORE playing
+        // the ack — server may finish synthesis during ack playback and push
+        // tts_start immediately.
+        _ensure_tts_handler_registered();
+        ws_client_expect_tts_stream(meta.pending_id);
         ws_client_expect_pending_ready(meta.pending_id);
+
         status_led_set(LED_GREEN);
         ws_client_send_state("playing", meta.pending_id);
         ret = play_wav(wav_out, wav_out_len);
@@ -178,51 +263,65 @@ esp_err_t voice_turn_execute(void)
             ESP_LOGE(TAG, "Failed to play ack WAV");
             status_led_set(LED_RED);
             beep_error();
+            ws_client_expect_tts_stream(NULL);
             return ret;
         }
 
-        // Short wait for WS push. Purely a log/telemetry hook for now — the
-        // server-side long-poll on /voice_result is already unblocked by the
-        // same asyncio.Event, so the GET below returns fast either way. When
-        // WS is up, this typically fires within a few ms.
-        esp_err_t wait_ret = ws_client_wait_pending_ready(500);
-        ESP_LOGI(TAG, "two-phase: pending_ready pushed=%s",
-                 (wait_ret == ESP_OK) ? "yes" : "no");
+        // Wait for tts_end to fire (stream handler drains audio_out in
+        // parallel). Typical completion within 1-3 s of ack end for a
+        // multi-sentence reply. Hard cap of 35 s for the pathological slow
+        // case.
+        int64_t t_stream_wait = esp_timer_get_time();
+        esp_err_t stream_ret = ws_client_wait_tts_end(35000);
+        int stream_ms = (int)((esp_timer_get_time() - t_stream_wait) / 1000);
 
-        // Fetch real answer (long-poll, blocks up to ~35 s).
-        status_led_set(LED_BLUE);
-        ws_client_send_state("uploading", meta.pending_id);
-        ESP_LOGI(TAG, "Fetching real answer for %s...", meta.pending_id);
+        if (stream_ret == ESP_OK) {
+            ESP_LOGI(TAG, "Real answer streamed over WS (wait=%d ms, underruns=%lu)",
+                     stream_ms,
+                     (unsigned long)audio_out_stream_underrun_count());
+        } else {
+            // Stream didn't complete — clear expectation and fall back to HTTP.
+            ws_client_expect_tts_stream(NULL);
+            if (s_tts_stream_opened) {
+                audio_out_stream_end(pdMS_TO_TICKS(500));
+                s_tts_stream_opened = false;
+            }
+            ESP_LOGW(TAG, "TTS stream timed out after %d ms, falling back to GET /voice_result",
+                     stream_ms);
 
-        uint8_t *real_wav = NULL;
-        size_t real_wav_len = 0;
-        voice_turn_meta_t real_meta;
+            status_led_set(LED_BLUE);
+            ws_client_send_state("uploading", meta.pending_id);
 
-        int64_t t_fetch = esp_timer_get_time();
-        ret = http_get_voice_result(meta.pending_id, &real_wav, &real_wav_len, &real_meta);
-        int fetch_ms = (int)((esp_timer_get_time() - t_fetch) / 1000);
+            uint8_t *real_wav = NULL;
+            size_t real_wav_len = 0;
+            voice_turn_meta_t real_meta;
 
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to fetch real answer (%d ms): %s",
-                     fetch_ms, esp_err_to_name(ret));
-            status_led_set(LED_RED);
-            beep_error();
-            return ret;
-        }
+            int64_t t_fetch = esp_timer_get_time();
+            ret = http_get_voice_result(meta.pending_id, &real_wav, &real_wav_len, &real_meta);
+            int fetch_ms = (int)((esp_timer_get_time() - t_fetch) / 1000);
 
-        ESP_LOGI(TAG, "Real answer: %d ms, %u bytes — %s",
-                 fetch_ms, (unsigned)real_wav_len, real_meta.reply_text);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to fetch real answer (%d ms): %s",
+                         fetch_ms, esp_err_to_name(ret));
+                status_led_set(LED_RED);
+                beep_error();
+                return ret;
+            }
 
-        status_led_set(LED_GREEN);
-        ws_client_send_state("playing", meta.pending_id);
-        ret = play_wav(real_wav, real_wav_len);
-        heap_caps_free(real_wav);
+            ESP_LOGI(TAG, "Fallback real answer: %d ms, %u bytes — %s",
+                     fetch_ms, (unsigned)real_wav_len, real_meta.reply_text);
 
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to play real answer WAV");
-            status_led_set(LED_RED);
-            beep_error();
-            return ret;
+            status_led_set(LED_GREEN);
+            ws_client_send_state("playing", meta.pending_id);
+            ret = play_wav(real_wav, real_wav_len);
+            heap_caps_free(real_wav);
+
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to play real answer WAV");
+                status_led_set(LED_RED);
+                beep_error();
+                return ret;
+            }
         }
     } else {
         // SINGLE-PHASE: play the response directly.
