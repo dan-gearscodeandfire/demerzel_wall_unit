@@ -121,6 +121,16 @@ esp_err_t http_post_voice_turn(const uint8_t *wav_data, size_t wav_len,
     }
 
     int status = esp_http_client_get_status_code(client);
+    if (status == 204) {
+        // Server intentionally dropped the turn (non-routable transcript,
+        // etc). Return OK with an empty body — caller skips playback.
+        ESP_LOGI(TAG, "Server returned 204 (drop silently)");
+        heap_caps_free(ctx.buf);
+        esp_http_client_cleanup(client);
+        *out_wav = NULL;
+        *out_wav_len = 0;
+        return ESP_OK;
+    }
     if (status != 200) {
         ESP_LOGE(TAG, "Server returned HTTP %d", status);
         heap_caps_free(ctx.buf);

@@ -364,19 +364,16 @@ async def voice_turn(request: web.Request) -> web.Response:
         return web.json_response({"error": "whisper_failed", "detail": str(e)}, status=500)
     log.info("transcript: %r", transcript)
 
-    # Filter non-speech
+    # Filter non-speech. Return 204 so the firmware stays silent — playing
+    # "I did not catch that" on every spurious wake is louder than the
+    # original misfire. The X-* headers are still set for debugging.
     if not _is_routable_transcript(transcript):
-        log.info("dropping non-speech transcript: %r", transcript)
-        fallback = "I did not catch that."
-        try:
-            wav_out = synthesize(fallback)
-        except Exception:
-            return web.json_response({"error": "synth_failed"}, status=500)
+        log.info("dropping non-speech transcript: %r (returning 204)", transcript)
         return web.Response(
-            body=wav_out, content_type="audio/wav",
+            status=204,
             headers={
                 "X-Transcript": _hdr_safe(transcript),
-                "X-Reply-Text": _hdr_safe(fallback),
+                "X-Dropped-Reason": "non_routable_transcript",
                 "X-Latency-Ms": str(int((time.monotonic() - t0) * 1000)),
             },
         )

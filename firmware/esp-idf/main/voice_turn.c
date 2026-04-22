@@ -13,6 +13,10 @@
 #include "freertos/task.h"
 #include <math.h>
 
+// esp_vad.h intentionally not included — WebRTC-port VAD mis-classifies
+// ambient motor/HVAC noise as speech at every mode. Capture is now
+// energy-threshold-based. esp-sr dep is retained for future AFE work.
+
 // Generate a short tone (sine wave) and play via audio_out.
 // freq_hz: tone frequency, duration_ms: length, rate: sample rate.
 static void beep(int freq_hz, int duration_ms, int rate)
@@ -53,6 +57,14 @@ static const char *TAG = "voice_turn";
 
 #define RECORD_RATE    16000
 #define PLAYBACK_CHUNK 4096
+
+// Max samples allocated for a single utterance. With VAD the utterance
+// ends early at end-of-speech; without VAD this is the full fixed window.
+#if CONFIG_DWU_VAD_ENABLED
+#define MAX_RECORD_SAMPLES (RECORD_RATE * CONFIG_DWU_VAD_MAX_RECORD_SECONDS)
+#else
+#define MAX_RECORD_SAMPLES (RECORD_RATE * CONFIG_DWU_RECORD_SECONDS)
+#endif
 
 // Streaming ring size. The server pushes all tts_chunks in a burst as soon
 // as synthesis completes — typically during ack WAV playback, which still
@@ -160,6 +172,119 @@ static esp_err_t play_wav(const uint8_t *wav, size_t wav_len)
     return ESP_OK;
 }
 
+// Capture one utterance into pcm using energy-threshold end-of-utterance.
+// Returns ESP_ERR_TIMEOUT if no speech-level energy was seen in the lead
+// window (spurious wake), ESP_FAIL if speech was too short to route, and
+// ESP_OK with *actual set on normal end-of-utterance or max-duration hit.
+static esp_err_t _capture_utterance(int16_t *pcm, size_t max_samples,
+                                     size_t *actual)
+{
+    if (actual) *actual = 0;
+
+#if CONFIG_DWU_VAD_ENABLED
+    const int frame_ms = 20;
+    const int frame_samples = (RECORD_RATE / 1000) * frame_ms;  // 320
+    const int hangover_frames = CONFIG_DWU_VAD_HANGOVER_MS / frame_ms;
+    const int max_lead_frames = CONFIG_DWU_VAD_MAX_LEAD_SILENCE_MS / frame_ms;
+    const int min_utter_frames = CONFIG_DWU_VAD_MIN_UTTERANCE_MS / frame_ms;
+    const int64_t speech_threshold =
+        (int64_t)CONFIG_DWU_VAD_SPEECH_ENERGY_THRESHOLD;
+
+    esp_err_t ret = audio_in_capture_arm(max_samples);
+    if (ret != ESP_OK) return ret;
+
+    size_t total = 0;
+    int lead_frames = 0;
+    int speech_frames = 0;
+    int trailing_silence = 0;
+    bool speech_started = false;
+    int64_t peak_mean_sq = 0;
+    int64_t t_capture = esp_timer_get_time();
+
+    while (total + (size_t)frame_samples <= max_samples) {
+        size_t got = 0;
+        while (got < (size_t)frame_samples) {
+            size_t r = audio_in_capture_read(pcm + total + got,
+                                              (size_t)frame_samples - got,
+                                              pdMS_TO_TICKS(300));
+            if (r == 0) break;
+            got += r;
+        }
+        if (got != (size_t)frame_samples) {
+            ESP_LOGW(TAG, "capture underrun (%u/%d) at total=%u",
+                     (unsigned)got, frame_samples, (unsigned)total);
+            total += got;
+            break;
+        }
+
+        int64_t sum_sq = 0;
+        for (int i = 0; i < frame_samples; i++) {
+            int32_t s = pcm[total + i];
+            sum_sq += (int64_t)s * s;
+        }
+        int64_t mean_sq = sum_sq / frame_samples;
+        if (mean_sq > peak_mean_sq) peak_mean_sq = mean_sq;
+        bool is_speech = (mean_sq >= speech_threshold);
+
+        total += (size_t)frame_samples;
+
+        if (is_speech) {
+            speech_frames++;
+            trailing_silence = 0;
+            if (!speech_started) {
+                speech_started = true;
+                int pre_ms = (int)((esp_timer_get_time() - t_capture) / 1000);
+                ESP_LOGI(TAG, "speech onset @ %d ms (meansq=%lld)",
+                         pre_ms, (long long)mean_sq);
+            }
+        } else {
+            if (!speech_started) {
+                lead_frames++;
+                if (lead_frames >= max_lead_frames) {
+                    ESP_LOGW(TAG, "no speech in %d ms (peak_meansq=%lld, "
+                                  "threshold=%lld) — abandoning turn",
+                             CONFIG_DWU_VAD_MAX_LEAD_SILENCE_MS,
+                             (long long)peak_mean_sq,
+                             (long long)speech_threshold);
+                    audio_in_capture_disarm();
+                    return ESP_ERR_TIMEOUT;
+                }
+            } else {
+                trailing_silence++;
+                if (trailing_silence >= hangover_frames) {
+                    int dur_ms = (int)((esp_timer_get_time() - t_capture) / 1000);
+                    ESP_LOGI(TAG, "end-of-speech @ %d ms "
+                                  "(speech=%d frames, trail=%d frames, "
+                                  "peak=%lld)",
+                             dur_ms, speech_frames, trailing_silence,
+                             (long long)peak_mean_sq);
+                    break;
+                }
+            }
+        }
+    }
+
+    audio_in_capture_disarm();
+
+    if (speech_frames < min_utter_frames) {
+        ESP_LOGW(TAG, "utterance too short (%d ms of speech < %d ms min, "
+                      "peak_meansq=%lld)",
+                 speech_frames * frame_ms,
+                 CONFIG_DWU_VAD_MIN_UTTERANCE_MS,
+                 (long long)peak_mean_sq);
+        return ESP_FAIL;
+    }
+
+    if (actual) *actual = total;
+    ESP_LOGI(TAG, "captured %u samples (%d ms, %d speech frames, peak=%lld)",
+             (unsigned)total, (int)(total * 1000 / RECORD_RATE),
+             speech_frames, (long long)peak_mean_sq);
+    return ESP_OK;
+#else
+    return audio_in_record(pcm, max_samples, actual);
+#endif
+}
+
 esp_err_t voice_turn_execute(void)
 {
     int64_t t_start = esp_timer_get_time();
@@ -174,9 +299,14 @@ esp_err_t voice_turn_execute(void)
     // Record
     status_led_set(LED_RED);
     ws_client_send_state("recording", NULL);
+#if CONFIG_DWU_VAD_ENABLED
+    ESP_LOGI(TAG, ">>> RECORDING (VAD, max %d s) <<<",
+             CONFIG_DWU_VAD_MAX_RECORD_SECONDS);
+#else
     ESP_LOGI(TAG, ">>> RECORDING %d SECONDS <<<", CONFIG_DWU_RECORD_SECONDS);
+#endif
 
-    size_t num_samples = RECORD_RATE * CONFIG_DWU_RECORD_SECONDS;
+    size_t num_samples = MAX_RECORD_SAMPLES;
     int16_t *pcm = heap_caps_malloc(num_samples * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!pcm) {
         ESP_LOGE(TAG, "Failed to allocate PCM buffer (%u bytes)", (unsigned)(num_samples * 2));
@@ -187,10 +317,19 @@ esp_err_t voice_turn_execute(void)
 
     size_t actual = 0;
     int64_t t_rec_start = esp_timer_get_time();
-    ret = audio_in_record(pcm, num_samples, &actual);
+    ret = _capture_utterance(pcm, num_samples, &actual);
 
+    if (ret == ESP_ERR_TIMEOUT) {
+        // Spurious wake: no speech heard. Quiet return — don't waste a
+        // server roundtrip. Error beep disabled here so a mis-fire doesn't
+        // produce an audible glitch.
+        heap_caps_free(pcm);
+        status_led_set(LED_OFF);
+        ws_client_send_state("idle", NULL);
+        return ESP_OK;
+    }
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "audio_in_record failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "capture failed: %s", esp_err_to_name(ret));
         heap_caps_free(pcm);
         status_led_set(LED_RED);
         beep_error();
@@ -240,6 +379,16 @@ esp_err_t voice_turn_execute(void)
     ESP_LOGI(TAG, "Heard:    %s", meta.transcript);
     ESP_LOGI(TAG, "Replying: %s", meta.reply_text);
     ESP_LOGI(TAG, "Server:   %d ms", meta.latency_ms);
+
+    // Empty body = server dropped the turn (e.g. 204 non-routable).
+    // Silently return to idle — no playback, no error beep.
+    if (wav_out_len == 0) {
+        if (wav_out) heap_caps_free(wav_out);
+        status_led_set(LED_OFF);
+        ws_client_send_state("idle", NULL);
+        ESP_LOGI(TAG, "Server dropped turn — silent return");
+        return ESP_OK;
+    }
 
     // --- Play response (single-phase or two-phase) ---
 

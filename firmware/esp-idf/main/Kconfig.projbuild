@@ -29,8 +29,77 @@ menu "DWU Configuration"
         default 8901
 
     config DWU_RECORD_SECONDS
-        int "Recording duration (seconds)"
+        int "Recording duration (seconds, fixed-window fallback)"
         default 8
+        help
+            Fallback fixed-window recording duration used only when
+            DWU_VAD_ENABLED=n. With VAD the utterance length is decided
+            by end-of-speech detection up to DWU_VAD_MAX_RECORD_SECONDS.
+
+    config DWU_VAD_ENABLED
+        bool "Use VAD-bounded recording (esp_vad.h)"
+        default y
+        help
+            When enabled, voice_turn records until the VAD reports
+            DWU_VAD_HANGOVER_MS of trailing silence (end-of-utterance).
+            When disabled, falls back to the fixed DWU_RECORD_SECONDS
+            window.
+
+    config DWU_VAD_MAX_RECORD_SECONDS
+        int "Max recording length with VAD (seconds)"
+        default 15
+        depends on DWU_VAD_ENABLED
+        help
+            Hard cap on how long a single utterance can be. Buffer is
+            sized for this in PSRAM (~2 * 16000 * N bytes).
+
+    config DWU_VAD_MODE
+        int "VAD aggressiveness mode (UNUSED — kept for sdkconfig compat)"
+        default 4
+        range 0 4
+        depends on DWU_VAD_ENABLED
+        help
+            Not wired up since 2026-04-22 — WebRTC-port esp_vad.h
+            classifies motor/HVAC rumble as speech at every mode in
+            real DWU environments. Capture now uses energy-threshold
+            end-of-utterance (see DWU_VAD_SPEECH_ENERGY_THRESHOLD).
+
+    config DWU_VAD_SPEECH_ENERGY_THRESHOLD
+        int "Mean-square energy for 'frame is speech' (int16 squared)"
+        default 30000000
+        depends on DWU_VAD_ENABLED
+        help
+            Per-20ms-frame pcm_meansq threshold. Frames at/above =
+            speech, below = silence. Tuning reference from observed
+            den environment: idle 20-40M, mic-near speech 100-350M,
+            motor/HVAC bursts 60-150M. Default 30M sits just above
+            quiet-room ambient. Raise if noise false-triggers onset,
+            lower if quiet speech ends captures prematurely.
+
+    config DWU_VAD_HANGOVER_MS
+        int "Silence ms after speech to end utterance"
+        default 800
+        depends on DWU_VAD_ENABLED
+        help
+            After the first VAD_SPEECH frame, once this many ms of
+            continuous VAD_SILENCE is observed, capture stops. 800 ms
+            covers typical inter-word pauses without truncating.
+
+    config DWU_VAD_MIN_UTTERANCE_MS
+        int "Reject utterances shorter than this (ms)"
+        default 300
+        depends on DWU_VAD_ENABLED
+        help
+            If total speech duration is below this, treat the turn as
+            a spurious wake (beep_error, skip upload).
+
+    config DWU_VAD_MAX_LEAD_SILENCE_MS
+        int "Give up waiting for first speech after this many ms"
+        default 2500
+        depends on DWU_VAD_ENABLED
+        help
+            Time budget from capture start until the first VAD_SPEECH.
+            If no speech is heard in this window, turn is abandoned.
 
     config DWU_FOLLOWUP_WINDOW_MS
         int "Followup window duration (ms)"
