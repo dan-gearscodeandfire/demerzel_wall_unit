@@ -1,4 +1,5 @@
 #include "http_client.h"
+#include "ws_client.h"
 #include "esp_http_client.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -105,6 +106,10 @@ esp_err_t http_post_voice_turn(const uint8_t *wav_data, size_t wav_len,
     }
 
     esp_http_client_set_header(client, "Content-Type", "audio/wav");
+    const char *unit_id = ws_client_unit_id();
+    if (unit_id && unit_id[0]) {
+        esp_http_client_set_header(client, "X-DWU-Unit-Id", unit_id);
+    }
     esp_http_client_set_post_field(client, (const char *)wav_data, (int)wav_len);
 
     esp_err_t err = esp_http_client_perform(client);

@@ -10,6 +10,7 @@
 #include "audio_out.h"
 #include "wake_word_task.h"
 #include "followup.h"
+#include "ws_client.h"
 
 #include "nvs_flash.h"
 #include "esp_log.h"
@@ -205,6 +206,10 @@ void app_main(void)
     ESP_LOGI(TAG, "FW version: %s, room: %s, mic: %s",
              ota_get_current_version(), CONFIG_DWU_ROOM_NAME, CONFIG_DWU_MIC_ID);
 
+    // Signaling-only WebSocket to voice_server. Best-effort — voice turns
+    // keep working over HTTP if this channel is down.
+    ws_client_start(ota_get_current_version());
+
 #ifdef CONFIG_DWU_TEST_ALL_DRIVERS
     run_driver_tests();
     ESP_LOGI(TAG, "Test mode — halting. Disable DWU_TEST_ALL_DRIVERS for normal operation.");
@@ -223,15 +228,19 @@ void app_main(void)
     }
     status_led_set(LED_OFF);
 
+    ws_client_send_state("idle", NULL);
     while (1) {
         xEventGroupWaitBits(s_trigger_events, WAKE_WORD_BIT,
                             pdTRUE, pdFALSE, portMAX_DELAY);
+
+        ws_client_send_wake((int)wake_word_task_last_score());
 
         if (!wifi_is_connected()) {
             ESP_LOGW(TAG, "WiFi not connected, skipping voice turn");
             status_led_set(LED_RED);
             vTaskDelay(pdMS_TO_TICKS(2000));
             status_led_set(LED_OFF);
+            ws_client_send_state("idle", NULL);
             continue;
         }
 
@@ -251,6 +260,7 @@ void app_main(void)
 
             // Followup window — dim teal LED signals "still listening".
             status_led_set_rgb(0, 40, 60);
+            ws_client_send_state("followup", NULL);
             do_turn = followup_detect_speech();
             if (do_turn) {
                 ESP_LOGI(TAG, "Followup speech detected — another turn");
@@ -260,6 +270,7 @@ void app_main(void)
         status_led_set(LED_OFF);
         vTaskDelay(pdMS_TO_TICKS(500));
         wake_word_task_resume();
+        ws_client_send_state("idle", NULL);
         log_heap_stats();
     }
 }

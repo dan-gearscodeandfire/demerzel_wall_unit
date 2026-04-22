@@ -109,6 +109,30 @@ PENDING_TTL = 120      # auto-cleanup stale entries after this many seconds
 PENDING_TIMEOUT = 30   # max seconds firmware will long-poll on /voice_result
 
 
+# --- WebSocket control channel: unit registry ---
+# Keyed by unit_id (wall-unit MAC, lowercase, colon-separated).
+# Value is the aiohttp WebSocketResponse. One ws per unit at a time; a
+# reconnect supersedes the previous entry.
+_clients: dict[str, web.WebSocketResponse] = {}
+_clients_lock = asyncio.Lock()
+WS_HEARTBEAT = 30   # aiohttp autoping interval, seconds
+
+
+async def notify_unit(unit_id: str, event_type: str, **payload) -> bool:
+    """Push a server→unit event. Returns True if delivered, False if unit
+    isn't connected or the send failed. Callers should treat WS as
+    best-effort — nothing in the audio path depends on it."""
+    ws = _clients.get(unit_id)
+    if ws is None or ws.closed:
+        return False
+    try:
+        await ws.send_json({"type": event_type, **payload})
+        return True
+    except Exception as e:
+        log.warning("notify_unit(%s, %s) failed: %s", unit_id, event_type, e)
+        return False
+
+
 def _stage2_from_decision(transcript: str, decision: dict) -> tuple[str, dict]:
     """Like stage2_pipeline but skips the router — decision already known."""
     debug = {"router": decision}
@@ -145,6 +169,12 @@ async def _slow_background(request_id: str, transcript: str, decision: dict):
         entry["error"] = str(e)
     finally:
         entry["event"].set()
+        # Best-effort WS push: lets the firmware GET /voice_result immediately
+        # instead of waiting out its long-poll. Falls through silently if the
+        # unit isn't on the control channel.
+        unit_id = entry.get("unit_id")
+        if unit_id:
+            await notify_unit(unit_id, "pending_ready", request_id=request_id)
 
 
 def stage2_pipeline(transcript: str) -> tuple[str, dict]:
@@ -179,7 +209,8 @@ def _hdr_safe(s: str) -> str:
 async def voice_turn(request: web.Request) -> web.Response:
     t0 = time.monotonic()
     wav_in = await request.read()
-    log.info("received %d bytes of audio", len(wav_in))
+    unit_id = (request.headers.get("X-DWU-Unit-Id") or "").strip().lower() or None
+    log.info("received %d bytes of audio (unit=%s)", len(wav_in), unit_id)
 
     try:
         transcript = transcribe(wav_in)
@@ -235,6 +266,7 @@ async def voice_turn(request: web.Request) -> web.Response:
                 "event": asyncio.Event(),
                 "wav": None, "reply_text": None, "debug": None, "error": None,
                 "created": time.monotonic(),
+                "unit_id": unit_id,
             }
             asyncio.ensure_future(_slow_background(request_id, transcript, decision))
 
@@ -350,12 +382,107 @@ async def voice_text(request: web.Request) -> web.Response:
     })
 
 
+async def ws_handler(request: web.Request) -> web.WebSocketResponse:
+    """Persistent control channel for wall units.
+
+    Protocol (JSON text frames, one event per frame):
+
+      unit→server:
+        {"type": "hello",    "unit_id": "<mac>", "room": "...", "mic_id": "...",
+                             "fw_version": "...", "caps": [...]}
+        {"type": "wake",     "score_peak": N, "ts_us": N}
+        {"type": "state",    "state": "idle|recording|uploading|playing|followup",
+                             "turn_id": "optional"}
+        {"type": "env",      "temp_c": ..., "humidity": ..., "pressure_hpa": ...}
+        {"type": "presence", "pir": bool, "radar": bool}
+
+      server→unit:
+        {"type": "pending_ready", "request_id": "..."}
+        {"type": "barge_in",      "reason": "..."}         # future: Stage 4
+        {"type": "suppress",      "ms": N}                 # future: arbitration
+        {"type": "config",        ...}                     # future
+
+    Registration happens on the first `hello` frame — no unit_id, no entry in
+    the registry. Keepalive is handled by aiohttp autoping (heartbeat=30 s).
+    """
+    ws = web.WebSocketResponse(heartbeat=WS_HEARTBEAT)
+    await ws.prepare(request)
+
+    unit_id: str | None = None
+    peer = request.remote
+
+    try:
+        async for msg in ws:
+            if msg.type != web.WSMsgType.TEXT:
+                # binary frames not expected; close cleanly
+                if msg.type == web.WSMsgType.ERROR:
+                    log.warning("ws error from %s: %s", peer, ws.exception())
+                continue
+
+            try:
+                evt = json.loads(msg.data)
+            except json.JSONDecodeError:
+                log.warning("ws %s: non-JSON frame, ignoring", peer)
+                continue
+
+            etype = evt.get("type")
+
+            if etype == "hello":
+                new_id = str(evt.get("unit_id") or "").strip().lower()
+                if not new_id:
+                    log.warning("ws %s: hello without unit_id, closing", peer)
+                    await ws.close(code=1008, message=b"unit_id required")
+                    return ws
+                async with _clients_lock:
+                    prev = _clients.get(new_id)
+                    if prev is not None and not prev.closed:
+                        log.info("ws %s: superseding previous connection for %s",
+                                 peer, new_id)
+                        try:
+                            await prev.close(code=1000, message=b"superseded")
+                        except Exception:
+                            pass
+                    _clients[new_id] = ws
+                unit_id = new_id
+                log.info("ws hello: unit=%s room=%s mic=%s fw=%s peer=%s",
+                         unit_id, evt.get("room"), evt.get("mic_id"),
+                         evt.get("fw_version"), peer)
+                await ws.send_json({"type": "hello_ack"})
+                continue
+
+            # All other events require a prior hello.
+            if unit_id is None:
+                log.warning("ws %s: %r before hello, ignoring", peer, etype)
+                continue
+
+            if etype in ("wake", "state", "env", "presence"):
+                log.info("ws %s %s %s", unit_id, etype,
+                         {k: v for k, v in evt.items() if k != "type"})
+            else:
+                log.warning("ws %s: unknown event type %r", unit_id, etype)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("ws handler crashed (unit=%s peer=%s)", unit_id, peer)
+    finally:
+        if unit_id is not None:
+            async with _clients_lock:
+                # Only remove if we still own the slot (a superseding reconnect
+                # may already have replaced us).
+                if _clients.get(unit_id) is ws:
+                    _clients.pop(unit_id, None)
+            log.info("ws closed: unit=%s peer=%s", unit_id, peer)
+
+    return ws
+
+
 async def health(request: web.Request) -> web.Response:
     return web.json_response({
         "status": "ok",
         "piper_bin": PIPER_BIN,
         "piper_voice": PIPER_VOICE,
         "whisper_url": WHISPER_URL,
+        "ws_clients": sorted(_clients.keys()),
     })
 
 
@@ -381,6 +508,7 @@ def main():
     app.router.add_post("/voice_turn", voice_turn)
     app.router.add_get("/voice_result/{request_id}", voice_result)
     app.router.add_post("/voice_text", voice_text)
+    app.router.add_get("/ws", ws_handler)
     app.router.add_get("/health", health)
     log.info("starting on %s:%d", LISTEN_HOST, LISTEN_PORT)
     web.run_app(app, host=LISTEN_HOST, port=LISTEN_PORT, access_log=None)

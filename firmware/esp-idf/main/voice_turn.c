@@ -4,6 +4,7 @@
 #include "status_led.h"
 #include "wav_util.h"
 #include "http_client.h"
+#include "ws_client.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -91,6 +92,7 @@ esp_err_t voice_turn_execute(void)
 
     // Record
     status_led_set(LED_RED);
+    ws_client_send_state("recording", NULL);
     ESP_LOGI(TAG, ">>> RECORDING %d SECONDS <<<", CONFIG_DWU_RECORD_SECONDS);
 
     size_t num_samples = RECORD_RATE * CONFIG_DWU_RECORD_SECONDS;
@@ -122,6 +124,7 @@ esp_err_t voice_turn_execute(void)
 
     // Process: wrap WAV, POST to server
     status_led_set(LED_BLUE);
+    ws_client_send_state("uploading", NULL);
     ESP_LOGI(TAG, "Uploading + processing on okDemerzel...");
 
     uint8_t *wav_in = NULL;
@@ -162,7 +165,11 @@ esp_err_t voice_turn_execute(void)
     if (meta.pending_id[0] != '\0') {
         // TWO-PHASE: play the ack first, then fetch + play the real answer.
         ESP_LOGI(TAG, "Two-phase: playing ack (pending_id=%s)...", meta.pending_id);
+        // Arm WS expectation BEFORE playing the ack — server may finish
+        // synthesis during ack playback and push pending_ready immediately.
+        ws_client_expect_pending_ready(meta.pending_id);
         status_led_set(LED_GREEN);
+        ws_client_send_state("playing", meta.pending_id);
         ret = play_wav(wav_out, wav_out_len);
         heap_caps_free(wav_out);
         wav_out = NULL;
@@ -174,8 +181,17 @@ esp_err_t voice_turn_execute(void)
             return ret;
         }
 
+        // Short wait for WS push. Purely a log/telemetry hook for now — the
+        // server-side long-poll on /voice_result is already unblocked by the
+        // same asyncio.Event, so the GET below returns fast either way. When
+        // WS is up, this typically fires within a few ms.
+        esp_err_t wait_ret = ws_client_wait_pending_ready(500);
+        ESP_LOGI(TAG, "two-phase: pending_ready pushed=%s",
+                 (wait_ret == ESP_OK) ? "yes" : "no");
+
         // Fetch real answer (long-poll, blocks up to ~35 s).
         status_led_set(LED_BLUE);
+        ws_client_send_state("uploading", meta.pending_id);
         ESP_LOGI(TAG, "Fetching real answer for %s...", meta.pending_id);
 
         uint8_t *real_wav = NULL;
@@ -198,6 +214,7 @@ esp_err_t voice_turn_execute(void)
                  fetch_ms, (unsigned)real_wav_len, real_meta.reply_text);
 
         status_led_set(LED_GREEN);
+        ws_client_send_state("playing", meta.pending_id);
         ret = play_wav(real_wav, real_wav_len);
         heap_caps_free(real_wav);
 
@@ -210,6 +227,7 @@ esp_err_t voice_turn_execute(void)
     } else {
         // SINGLE-PHASE: play the response directly.
         status_led_set(LED_GREEN);
+        ws_client_send_state("playing", NULL);
         ESP_LOGI(TAG, "Playing response...");
         ret = play_wav(wav_out, wav_out_len);
         heap_caps_free(wav_out);
