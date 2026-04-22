@@ -18,18 +18,19 @@ GET /health
     Returns {"status": "ok", ...}
 """
 import asyncio
+import base64
+import io
 import json
 import logging
 import os
 import re
-import subprocess
-import tempfile
 import time
 import uuid
 import wave
 
 import requests
 from aiohttp import web
+from piper import PiperVoice
 
 import router as router_mod
 import tools as tools_mod
@@ -42,11 +43,22 @@ logging.basicConfig(
 log = logging.getLogger("voice-server")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PIPER_BIN = os.path.join(HERE, ".venv", "bin", "piper")
-PIPER_VOICE = os.path.join(HERE, "voices", "en_US-lessac-medium.onnx")
+PIPER_BIN = os.path.join(HERE, ".venv", "bin", "piper")   # legacy; unused now
+PIPER_VOICE = os.path.join(HERE, "voices", "en_US-lessac-low.onnx")
 WHISPER_URL = "http://127.0.0.1:8891/inference"
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8900
+
+# Streaming TTS: chunk granularity for the WS `tts_chunk` frames.
+# 40 ms @ 16 kHz int16 mono = 640 samples = 1280 bytes. Small enough for a
+# responsive jitter buffer on the firmware side, large enough that the per-
+# frame JSON+base64 overhead stays reasonable.
+TTS_CHUNK_SAMPLES = 640
+TTS_CHUNK_BYTES = TTS_CHUNK_SAMPLES * 2
+
+# Loaded once at startup by _load_voice(). Piper's synthesize() is thread-safe
+# for read access; single global instance is fine.
+_voice: PiperVoice | None = None
 
 
 def transcribe(wav_bytes: bytes) -> str:
@@ -58,25 +70,35 @@ def transcribe(wav_bytes: bytes) -> str:
     return r.json().get("text", "").strip()
 
 
+def _load_voice() -> PiperVoice:
+    """Load the Piper voice model once at startup. Idempotent."""
+    global _voice
+    if _voice is None:
+        t0 = time.monotonic()
+        _voice = PiperVoice.load(PIPER_VOICE)
+        log.info("piper voice loaded: %s (sample_rate=%d, %.0f ms)",
+                 os.path.basename(PIPER_VOICE),
+                 _voice.config.sample_rate,
+                 (time.monotonic() - t0) * 1000)
+    return _voice
+
+
+def _wrap_wav(pcm_bytes: bytes, sample_rate: int, channels: int = 1) -> bytes:
+    """Wrap raw int16 PCM into a complete WAV container."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)  # int16
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm_bytes)
+    return buf.getvalue()
+
+
 def synthesize(text: str) -> bytes:
-    """Run Piper as a subprocess and return the generated WAV bytes."""
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        out_path = f.name
-    try:
-        proc = subprocess.run(
-            [PIPER_BIN, "--model", PIPER_VOICE, "--output_file", out_path],
-            input=text,
-            text=True,
-            capture_output=True,
-            check=True,
-        )
-        with open(out_path, "rb") as fh:
-            return fh.read()
-    finally:
-        try:
-            os.unlink(out_path)
-        except FileNotFoundError:
-            pass
+    """Synthesize text via the Piper library and return complete WAV bytes."""
+    v = _load_voice()
+    pcm = b"".join(c.audio_int16_bytes for c in v.synthesize(text))
+    return _wrap_wav(pcm, v.config.sample_rate)
 
 
 _WHISPER_ANNOT_RE = re.compile(r"^\s*(?:[\[\(][^\]\)]*[\]\)]\s*)+$")
@@ -146,18 +168,140 @@ def _stage2_from_decision(transcript: str, decision: dict) -> tuple[str, dict]:
     return spoken, debug
 
 
-async def _slow_background(request_id: str, transcript: str, decision: dict):
-    """Run tool dispatch + compose + synthesize in background, store result."""
-    entry = _pending[request_id]
+async def _stream_synthesis_to_ws(
+    unit_id: str,
+    request_id: str,
+    text: str,
+    pcm_sink: bytearray,
+) -> tuple[bool, int, int]:
+    """Synthesize `text` one sentence at a time (piper yields AudioChunk per
+    sentence). Stream each sentence's PCM to the unit in TTS_CHUNK_BYTES-sized
+    sub-chunks over WS, and append every byte to `pcm_sink` so the caller can
+    still materialize a WAV for the HTTP fallback.
+
+    Returns (streamed_ok, total_seq, sample_rate). If the unit isn't
+    connected or the WS closes mid-stream, returns (False, seq_at_failure, sr)
+    and the caller falls back to the pending_ready + /voice_result path.
+    Synthesis still completes into `pcm_sink` either way.
+    """
+    loop = asyncio.get_event_loop()
+    v = _load_voice()
+    sample_rate = v.config.sample_rate
+
+    ws = _clients.get(unit_id)
+    ws_ok = ws is not None and not ws.closed
+    if ws_ok:
+        try:
+            await ws.send_json({
+                "type": "tts_start",
+                "request_id": request_id,
+                "sample_rate": sample_rate,
+                "channels": 1,
+            })
+        except Exception as e:
+            log.warning("tts_start send failed (unit=%s): %s", unit_id, e)
+            ws_ok = False
+
+    # Producer: run piper in a thread, push AudioChunks into an asyncio queue.
+    # Sentinel None = end of stream.
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def producer():
+        try:
+            for chunk in v.synthesize(text):
+                asyncio.run_coroutine_threadsafe(queue.put(chunk), loop).result()
+        except Exception as e:
+            log.exception("piper producer failed: %s", e)
+            asyncio.run_coroutine_threadsafe(queue.put(e), loop).result()
+        finally:
+            asyncio.run_coroutine_threadsafe(queue.put(None), loop).result()
+
+    producer_future = loop.run_in_executor(None, producer)
+
+    seq = 0
     try:
-        loop = asyncio.get_event_loop()
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            if isinstance(item, Exception):
+                raise item
+            pcm = item.audio_int16_bytes
+            pcm_sink.extend(pcm)
+            if not ws_ok:
+                continue
+            for i in range(0, len(pcm), TTS_CHUNK_BYTES):
+                sub = pcm[i:i + TTS_CHUNK_BYTES]
+                if ws.closed:
+                    ws_ok = False
+                    break
+                try:
+                    await ws.send_json({
+                        "type": "tts_chunk",
+                        "request_id": request_id,
+                        "seq": seq,
+                        "payload": base64.b64encode(sub).decode("ascii"),
+                    })
+                    seq += 1
+                except Exception as e:
+                    log.warning("tts_chunk send failed at seq=%d: %s", seq, e)
+                    ws_ok = False
+                    break
+    finally:
+        # Ensure the producer finishes even on failure, so we don't leak threads.
+        try:
+            await producer_future
+        except Exception:
+            pass
+
+    if ws_ok and not ws.closed:
+        try:
+            await ws.send_json({
+                "type": "tts_end",
+                "request_id": request_id,
+                "total_seq": seq,
+            })
+        except Exception as e:
+            log.warning("tts_end send failed: %s", e)
+            ws_ok = False
+
+    return ws_ok, seq, sample_rate
+
+
+async def _slow_background(request_id: str, transcript: str, decision: dict):
+    """Run tool dispatch + compose + synthesize in background. Streams TTS
+    PCM to the unit over WS as each sentence finishes (if the unit is on the
+    control channel), and also accumulates the full PCM into a WAV stored in
+    `_pending[request_id].wav` for the HTTP `/voice_result` fallback path."""
+    entry = _pending[request_id]
+    unit_id = entry.get("unit_id")
+    loop = asyncio.get_event_loop()
+    try:
         reply, debug = await loop.run_in_executor(
             None, _stage2_from_decision, transcript, decision
         )
-        wav_out = await loop.run_in_executor(None, synthesize, reply)
-        entry["wav"] = wav_out
         entry["reply_text"] = reply
         entry["debug"] = debug
+
+        pcm_accumulator = bytearray()
+        if unit_id:
+            t_synth = time.monotonic()
+            streamed, total_seq, sample_rate = await _stream_synthesis_to_ws(
+                unit_id, request_id, reply, pcm_accumulator,
+            )
+            synth_ms = int((time.monotonic() - t_synth) * 1000)
+            entry["streamed_over_ws"] = streamed
+            log.info("slow synth+stream (unit=%s, req=%s): streamed=%s seq=%d %dms",
+                     unit_id, request_id, streamed, total_seq, synth_ms)
+        else:
+            # No unit to stream to — synthesize inline, WAV for HTTP fallback only.
+            v = _load_voice()
+            sample_rate = v.config.sample_rate
+            for chunk in v.synthesize(reply):
+                pcm_accumulator.extend(chunk.audio_int16_bytes)
+            entry["streamed_over_ws"] = False
+
+        entry["wav"] = _wrap_wav(bytes(pcm_accumulator), sample_rate)
     except Exception as e:
         log.exception("background task failed for %s", request_id)
         fallback = "Sorry, something went wrong."
@@ -167,14 +311,15 @@ async def _slow_background(request_id: str, transcript: str, decision: dict):
             entry["wav"] = b""
         entry["reply_text"] = fallback
         entry["error"] = str(e)
+        entry["streamed_over_ws"] = False
     finally:
         entry["event"].set()
-        # Best-effort WS push: lets the firmware GET /voice_result immediately
-        # instead of waiting out its long-poll. Falls through silently if the
-        # unit isn't on the control channel.
-        unit_id = entry.get("unit_id")
+        # Always emit pending_ready as a safety net. Firmware that already
+        # received tts_end ignores it; firmware that missed the stream uses it
+        # to short-circuit the /voice_result long-poll.
         if unit_id:
-            await notify_unit(unit_id, "pending_ready", request_id=request_id)
+            await notify_unit(unit_id, "pending_ready", request_id=request_id,
+                              streamed=entry.get("streamed_over_ws", False))
 
 
 def stage2_pipeline(transcript: str) -> tuple[str, dict]:
@@ -295,9 +440,6 @@ async def voice_turn(request: web.Request) -> web.Response:
 
     try:
         wav_out = synthesize(reply)
-    except subprocess.CalledProcessError as e:
-        log.exception("piper failed: %s", e.stderr)
-        return web.json_response({"error": "piper_failed", "detail": e.stderr}, status=500)
     except Exception as e:
         log.exception("piper failed")
         return web.json_response({"error": "piper_failed", "detail": str(e)}, status=500)
@@ -397,10 +539,21 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
         {"type": "presence", "pir": bool, "radar": bool}
 
       server→unit:
-        {"type": "pending_ready", "request_id": "..."}
+        {"type": "tts_start",     "request_id": "...", "sample_rate": 16000,
+                                  "channels": 1}
+        {"type": "tts_chunk",     "request_id": "...", "seq": N,
+                                  "payload": "<base64 int16 PCM LE>"}
+        {"type": "tts_end",       "request_id": "...", "total_seq": N}
+        {"type": "pending_ready", "request_id": "...", "streamed": bool}
         {"type": "barge_in",      "reason": "..."}         # future: Stage 4
         {"type": "suppress",      "ms": N}                 # future: arbitration
         {"type": "config",        ...}                     # future
+
+    TTS streaming: for slow-class turns, the background synthesizer pushes
+    `tts_start`, a sequence of `tts_chunk` frames (one per TTS_CHUNK_BYTES of
+    PCM), and a final `tts_end`. `pending_ready` is always emitted afterwards
+    as a safety net — its `streamed` flag tells firmware whether it already
+    received the full stream and can skip the `/voice_result` long-poll.
 
     Registration happens on the first `hello` frame — no unit_id, no entry in
     the registry. Keepalive is handled by aiohttp autoping (heartbeat=30 s).
@@ -477,12 +630,15 @@ async def ws_handler(request: web.Request) -> web.WebSocketResponse:
 
 
 async def health(request: web.Request) -> web.Response:
+    sr = _voice.config.sample_rate if _voice is not None else None
     return web.json_response({
         "status": "ok",
-        "piper_bin": PIPER_BIN,
         "piper_voice": PIPER_VOICE,
+        "piper_sample_rate": sr,
         "whisper_url": WHISPER_URL,
         "ws_clients": sorted(_clients.keys()),
+        "tts_streaming": True,
+        "tts_chunk_bytes": TTS_CHUNK_BYTES,
     })
 
 
@@ -499,6 +655,9 @@ async def _cleanup_pending(app):
 
 
 async def on_startup(app):
+    # Load the Piper model up-front so the first turn doesn't pay ONNX
+    # cold-start cost. ~300-800 ms on okDemerzel.
+    await asyncio.get_event_loop().run_in_executor(None, _load_voice)
     asyncio.ensure_future(_cleanup_pending(app))
 
 

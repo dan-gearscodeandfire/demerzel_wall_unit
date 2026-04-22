@@ -184,17 +184,55 @@ async def _case_notify_unknown_unit(port):
     _expect("notify_unit for unknown unit → False", delivered is False)
 
 
+class _FakeAudioChunk:
+    def __init__(self, pcm_bytes: bytes):
+        self.audio_int16_bytes = pcm_bytes
+
+
+class _FakeVoice:
+    """Minimal stand-in for piper.PiperVoice for tests. `synthesize(text)`
+    yields one AudioChunk per entry in `sentences`."""
+    class _Cfg:
+        sample_rate = 16000
+
+    def __init__(self, sentences):
+        self._sentences = list(sentences)
+        self.config = _FakeVoice._Cfg()
+
+    def synthesize(self, text):
+        for pcm in self._sentences:
+            yield _FakeAudioChunk(pcm)
+
+
+def _install_fake_voice(sentences):
+    """Install a fake piper voice + remember originals for restore."""
+    originals = {"_voice": voice_server._voice}
+    voice_server._voice = _FakeVoice(sentences)
+    return originals
+
+
+def _restore_fake_voice(originals):
+    voice_server._voice = originals["_voice"]
+
+
+async def _stub_stream(unit_id, request_id, text, pcm_sink, *,
+                        pcm=b"\x11\x22" * 8, streamed=True, sample_rate=16000):
+    """Drop-in replacement for _stream_synthesis_to_ws that writes a canned
+    blob into the sink and skips the real piper + ws paths."""
+    pcm_sink.extend(pcm)
+    return streamed, 3 if streamed else 0, sample_rate
+
+
 async def _case_slow_background_pushes_pending_ready(port):
     """End-to-end: _slow_background's finally block must push pending_ready
     to the originating unit's WS after the synthesis completes."""
     url = f"http://127.0.0.1:{port}/ws"
     unit_id = "aa:bb:cc:00:00:04"
 
-    # Patch the heavy bits so we can run the background task inline.
     orig_stage2 = voice_server._stage2_from_decision
-    orig_synth = voice_server.synthesize
+    orig_stream = voice_server._stream_synthesis_to_ws
     voice_server._stage2_from_decision = lambda t, d: ("ok", {})
-    voice_server.synthesize = lambda text: b"RIFF\x00\x00\x00\x00WAVEfake"
+    voice_server._stream_synthesis_to_ws = _stub_stream
 
     async with aiohttp.ClientSession() as sess:
         async with sess.ws_connect(url) as ws:
@@ -219,23 +257,36 @@ async def _case_slow_background_pushes_pending_ready(port):
                 _expect("_slow_background pushed pending_ready",
                         evt is not None and evt.get("request_id") == request_id,
                         detail=f"evt={evt}")
+                _expect("pending_ready carries streamed flag",
+                        evt is not None and evt.get("streamed") is True,
+                        detail=f"evt={evt}")
 
                 entry = voice_server._pending.get(request_id)
                 _expect("pending entry still populated after push",
                         entry is not None and entry["event"].is_set())
+                _expect("entry.wav populated with WAV container",
+                        entry is not None and entry["wav"].startswith(b"RIFF"))
             finally:
                 voice_server._pending.pop(request_id, None)
                 voice_server._stage2_from_decision = orig_stage2
-                voice_server.synthesize = orig_synth
+                voice_server._stream_synthesis_to_ws = orig_stream
 
 
 async def _case_slow_background_no_ws_client(port):
     """If unit_id is set but there's no live WS, _slow_background must NOT
-    raise — pending_ready push is best-effort only."""
+    raise — pending_ready push is best-effort only, and the tee-to-WAV path
+    still delivers `wav` for the HTTP /voice_result fallback."""
     orig_stage2 = voice_server._stage2_from_decision
-    orig_synth = voice_server.synthesize
+    orig_stream = voice_server._stream_synthesis_to_ws
     voice_server._stage2_from_decision = lambda t, d: ("ok", {})
-    voice_server.synthesize = lambda text: b"RIFF"
+
+    async def _offline_stream(unit_id, request_id, text, pcm_sink):
+        # Simulate "unit not in _clients": no ws frames emitted, streamed=False,
+        # but synthesis still produced PCM into the sink.
+        pcm_sink.extend(b"\xaa\xbb" * 16)
+        return False, 0, 16000
+
+    voice_server._stream_synthesis_to_ws = _offline_stream
 
     request_id = "slowtest2"
     voice_server._pending[request_id] = {
@@ -246,16 +297,98 @@ async def _case_slow_background_no_ws_client(port):
     }
     try:
         await voice_server._slow_background(request_id, "x", {"tool": "t"})
-        _expect("no-ws push is a no-op (no exception)", True)
+        entry = voice_server._pending[request_id]
+        _expect("no-ws path is a no-op (no exception)", True)
         _expect("event still set so /voice_result can return",
-                voice_server._pending[request_id]["event"].is_set())
+                entry["event"].is_set())
+        _expect("entry.wav still populated despite offline unit",
+                entry["wav"].startswith(b"RIFF"))
+        _expect("streamed_over_ws flag is False",
+                entry.get("streamed_over_ws") is False)
     except Exception as e:
-        _expect("no-ws push is a no-op (no exception)", False,
+        _expect("no-ws path is a no-op (no exception)", False,
                 detail=f"raised {e!r}")
     finally:
         voice_server._pending.pop(request_id, None)
         voice_server._stage2_from_decision = orig_stage2
-        voice_server.synthesize = orig_synth
+        voice_server._stream_synthesis_to_ws = orig_stream
+
+
+async def _case_stream_synthesis_delivers_chunks(port):
+    """Real _stream_synthesis_to_ws with a fake PiperVoice must emit
+    tts_start, one tts_chunk per TTS_CHUNK_BYTES of PCM, and a final tts_end
+    with the correct total_seq."""
+    import base64 as _b64
+    url = f"http://127.0.0.1:{port}/ws"
+    unit_id = "aa:bb:cc:00:00:05"
+
+    # Two sentences: first = 2.5 sub-chunks worth of PCM, second = 0.5.
+    # Total expected sub-chunks = 3 + 1 = 4.
+    CHUNK = voice_server.TTS_CHUNK_BYTES
+    s1 = bytes(range(256)) * (CHUNK * 3 // 256 - 10)  # just under 3 chunks
+    s1 = (b"\x01" * (CHUNK * 2 + CHUNK // 2))         # exactly 2.5 chunks
+    s2 = (b"\x02" * (CHUNK // 2))                     # 0.5 chunks
+    # sub-chunks emitted: ceil(2.5)=3 from s1, ceil(0.5)=1 from s2 → 4 total
+    expected_seq = 4
+
+    originals = _install_fake_voice([s1, s2])
+
+    async with aiohttp.ClientSession() as sess:
+        async with sess.ws_connect(url) as ws:
+            await ws.send_json({"type": "hello", "unit_id": unit_id, "room": "den"})
+            await _drain_until(ws, "hello_ack", timeout=2.0)
+
+            try:
+                pcm_sink = bytearray()
+                streamed, seq, sr = await voice_server._stream_synthesis_to_ws(
+                    unit_id, "streamtest1", "two sentences here.", pcm_sink)
+
+                _expect("_stream_synthesis_to_ws returned streamed=True", streamed)
+                _expect("total_seq matches expected sub-chunks",
+                        seq == expected_seq, detail=f"seq={seq} expected={expected_seq}")
+                _expect("sample_rate forwarded from voice config", sr == 16000)
+                _expect("pcm_sink contains all sentence bytes",
+                        bytes(pcm_sink) == s1 + s2,
+                        detail=f"got {len(pcm_sink)} bytes, expected {len(s1)+len(s2)}")
+
+                start = await _drain_until(ws, "tts_start", timeout=2.0)
+                _expect("tts_start delivered",
+                        start is not None
+                        and start.get("request_id") == "streamtest1"
+                        and start.get("sample_rate") == 16000
+                        and start.get("channels") == 1,
+                        detail=f"start={start}")
+
+                chunks = []
+                for _ in range(expected_seq):
+                    c = await _drain_until(ws, "tts_chunk", timeout=2.0)
+                    if c is None:
+                        break
+                    chunks.append(c)
+
+                _expect(f"received {expected_seq} tts_chunk frames",
+                        len(chunks) == expected_seq,
+                        detail=f"got {len(chunks)}")
+
+                seqs = [c.get("seq") for c in chunks]
+                _expect("seq numbers are 0..N-1 contiguous",
+                        seqs == list(range(expected_seq)),
+                        detail=f"seqs={seqs}")
+
+                reconstructed = b"".join(
+                    _b64.b64decode(c.get("payload", "")) for c in chunks)
+                _expect("payload bytes round-trip to original PCM",
+                        reconstructed == s1 + s2,
+                        detail=f"reconstructed {len(reconstructed)} vs expected {len(s1)+len(s2)}")
+
+                end = await _drain_until(ws, "tts_end", timeout=2.0)
+                _expect("tts_end delivered with correct total_seq",
+                        end is not None
+                        and end.get("request_id") == "streamtest1"
+                        and end.get("total_seq") == expected_seq,
+                        detail=f"end={end}")
+            finally:
+                _restore_fake_voice(originals)
 
 
 async def _case_events_accepted(port):
@@ -294,6 +427,7 @@ async def main():
         await _case_events_accepted(port)
         await _case_slow_background_pushes_pending_ready(port)
         await _case_slow_background_no_ws_client(port)
+        await _case_stream_synthesis_delivers_chunks(port)
     finally:
         await runner.cleanup()
 
