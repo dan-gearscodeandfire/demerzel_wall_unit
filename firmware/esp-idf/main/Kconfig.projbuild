@@ -124,6 +124,27 @@ menu "DWU Configuration"
             Require this many consecutive chunks above the energy threshold
             before declaring speech. 8 = 80ms. Prevents pops/clicks.
 
+    config DWU_ENCODE_OPUS
+        bool "Encode captured audio as Opus before upload"
+        default n
+        help
+            When enabled, voice_turn encodes the captured int16 PCM as
+            length-prefixed Opus frames (VOIP mode, 20 ms per frame) and
+            uploads them with Content-Type application/x-dwu-opus. Cuts
+            upload bandwidth by ~10x vs raw WAV. Server must have opuslib
+            + libopus0 installed to decode. Disable to send WAV for
+            compatibility / rollback.
+
+    config DWU_OPUS_BITRATE_BPS
+        int "Opus target bitrate (bits/sec)"
+        default 24000
+        depends on DWU_ENCODE_OPUS
+        help
+            VOIP-mode target. 24 kbps is the sweet spot for 16 kHz mono
+            speech — fully intelligible for whisper, small payload. Bump
+            to 32000 if bench shows WER regression, drop to 16000 for
+            faster cellular uploads on future XIAO migrations.
+
     config DWU_TTS_RING_KB
         int "Streaming TTS ring buffer size (KB)"
         default 128

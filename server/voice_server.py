@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import re
+import struct
 import time
 import uuid
 import wave
@@ -31,6 +32,13 @@ import wave
 import requests
 from aiohttp import web
 from piper import PiperVoice
+
+try:
+    import opuslib
+    HAVE_OPUSLIB = True
+except ImportError:  # pragma: no cover — decoded transcripts just fail noisily
+    opuslib = None
+    HAVE_OPUSLIB = False
 
 import router as router_mod
 import tools as tools_mod
@@ -59,6 +67,32 @@ TTS_CHUNK_BYTES = TTS_CHUNK_SAMPLES * 2
 # Loaded once at startup by _load_voice(). Piper's synthesize() is thread-safe
 # for read access; single global instance is fine.
 _voice: PiperVoice | None = None
+
+
+def _decode_dwu_opus(body: bytes, sample_rate: int, channels: int,
+                     frame_ms: int) -> bytes:
+    """Decode length-prefixed Opus frames into a WAV container.
+
+    Wire format: repeated [u16 LE packet_len][packet bytes]. Frame metadata
+    (sample_rate/channels/frame_ms) comes from X-DWU-Opus-* headers.
+    """
+    if not HAVE_OPUSLIB:
+        raise RuntimeError("opuslib not installed — pip install opuslib")
+
+    decoder = opuslib.Decoder(sample_rate, channels)
+    frame_samples = sample_rate * frame_ms // 1000
+    pcm_chunks = []
+    p = 0
+    n = len(body)
+    while p + 2 <= n:
+        plen = struct.unpack_from("<H", body, p)[0]
+        p += 2
+        if plen == 0 or p + plen > n:
+            break
+        pcm_chunks.append(decoder.decode(body[p:p+plen], frame_samples))
+        p += plen
+    pcm = b"".join(pcm_chunks)
+    return _wrap_wav(pcm, sample_rate, channels)
 
 
 def transcribe(wav_bytes: bytes) -> str:
@@ -353,9 +387,30 @@ def _hdr_safe(s: str) -> str:
 
 async def voice_turn(request: web.Request) -> web.Response:
     t0 = time.monotonic()
-    wav_in = await request.read()
+    body = await request.read()
     unit_id = (request.headers.get("X-DWU-Unit-Id") or "").strip().lower() or None
-    log.info("received %d bytes of audio (unit=%s)", len(wav_in), unit_id)
+    content_type = (request.headers.get("Content-Type") or "").lower()
+
+    # Decode the wire format into a WAV suitable for whisper.
+    if "x-dwu-opus" in content_type:
+        try:
+            rate = int(request.headers.get("X-DWU-Opus-Rate") or 16000)
+            channels = int(request.headers.get("X-DWU-Opus-Channels") or 1)
+            frame_ms = int(request.headers.get("X-DWU-Opus-Frame-Ms") or 20)
+            t_dec = time.monotonic()
+            wav_in = _decode_dwu_opus(body, rate, channels, frame_ms)
+            dec_ms = int((time.monotonic() - t_dec) * 1000)
+            log.info("received %d opus bytes -> %d wav bytes (%.1fx, %d ms, "
+                     "unit=%s)",
+                     len(body), len(wav_in), len(wav_in) / max(len(body), 1),
+                     dec_ms, unit_id)
+        except Exception as e:
+            log.exception("opus decode failed")
+            return web.json_response({"error": "opus_decode_failed",
+                                       "detail": str(e)}, status=400)
+    else:
+        wav_in = body
+        log.info("received %d bytes of audio (unit=%s)", len(wav_in), unit_id)
 
     try:
         transcript = transcribe(wav_in)

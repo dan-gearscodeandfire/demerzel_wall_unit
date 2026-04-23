@@ -17,6 +17,10 @@
 // ambient motor/HVAC noise as speech at every mode. Capture is now
 // energy-threshold-based. esp-sr dep is retained for future AFE work.
 
+#if CONFIG_DWU_ENCODE_OPUS
+#include "opus_stream.h"
+#endif
+
 // Generate a short tone (sine wave) and play via audio_out.
 // freq_hz: tone frequency, duration_ms: length, rate: sample rate.
 static void beep(int freq_hz, int duration_ms, int rate)
@@ -342,30 +346,78 @@ esp_err_t voice_turn_execute(void)
     // Audible "stop" beep (lower pitch) so user knows recording ended
     beep(600, 150, 16000);  // 600 Hz, 150 ms
 
-    // Process: wrap WAV, POST to server
+    // Process: encode (Opus or WAV), POST to server
     status_led_set(LED_BLUE);
     ws_client_send_state("uploading", NULL);
     ESP_LOGI(TAG, "Uploading + processing on okDemerzel...");
 
-    uint8_t *wav_in = NULL;
-    size_t wav_in_len = 0;
-    ret = wav_wrap(pcm, actual, RECORD_RATE, &wav_in, &wav_in_len);
-    heap_caps_free(pcm);
+    uint8_t *body = NULL;
+    size_t body_len = 0;
+    const char *content_type = "audio/wav";
+    int opus_rate = 0, opus_channels = 0, opus_frame_ms = 0;
 
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "wav_wrap failed");
-        status_led_set(LED_RED);
-        beep_error();
-        return ret;
+#if CONFIG_DWU_ENCODE_OPUS
+    const int frame_samples = RECORD_RATE / 50;  // 20 ms
+    opus_stream_t *enc = NULL;
+    int64_t t_enc_start = esp_timer_get_time();
+    ret = opus_stream_create(RECORD_RATE, 1, CONFIG_DWU_OPUS_BITRATE_BPS, &enc);
+    if (ret == ESP_OK) {
+        size_t off = 0;
+        while (off + (size_t)frame_samples <= actual) {
+            esp_err_t er = opus_stream_encode_frame(enc, pcm + off, frame_samples);
+            if (er != ESP_OK) {
+                ESP_LOGW(TAG, "opus encode stopped at off=%u: %s",
+                         (unsigned)off, esp_err_to_name(er));
+                break;
+            }
+            off += (size_t)frame_samples;
+        }
+        ret = opus_stream_finalize(enc, &body, &body_len);
+        opus_stream_destroy(enc);
+        if (ret == ESP_OK && body_len > 0) {
+            int enc_ms = (int)((esp_timer_get_time() - t_enc_start) / 1000);
+            int pcm_bytes = (int)(actual * sizeof(int16_t));
+            ESP_LOGI(TAG, "Opus encoded: %u bytes (pcm=%d bytes, %.1fx "
+                          "reduction, %d ms)",
+                     (unsigned)body_len, pcm_bytes,
+                     (double)pcm_bytes / (double)body_len, enc_ms);
+            content_type = "application/x-dwu-opus";
+            opus_rate = RECORD_RATE;
+            opus_channels = 1;
+            opus_frame_ms = 20;
+        } else {
+            ESP_LOGW(TAG, "opus path produced empty body — falling back to WAV");
+            if (body) heap_caps_free(body);
+            body = NULL;
+            body_len = 0;
+        }
+    } else {
+        ESP_LOGW(TAG, "opus_stream_create failed: %s — falling back to WAV",
+                 esp_err_to_name(ret));
     }
+#endif
+
+    if (body == NULL) {
+        ret = wav_wrap(pcm, actual, RECORD_RATE, &body, &body_len);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "wav_wrap failed");
+            heap_caps_free(pcm);
+            status_led_set(LED_RED);
+            beep_error();
+            return ret;
+        }
+    }
+    heap_caps_free(pcm);
 
     uint8_t *wav_out = NULL;
     size_t wav_out_len = 0;
     voice_turn_meta_t meta;
 
     int64_t t_http_start = esp_timer_get_time();
-    ret = http_post_voice_turn(wav_in, wav_in_len, &wav_out, &wav_out_len, &meta);
-    heap_caps_free(wav_in);
+    ret = http_post_voice_turn(body, body_len, content_type,
+                                opus_rate, opus_channels, opus_frame_ms,
+                                &wav_out, &wav_out_len, &meta);
+    heap_caps_free(body);
 
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "HTTP POST failed: %s", esp_err_to_name(ret));

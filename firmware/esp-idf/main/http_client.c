@@ -67,7 +67,10 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
     return ESP_OK;
 }
 
-esp_err_t http_post_voice_turn(const uint8_t *wav_data, size_t wav_len,
+esp_err_t http_post_voice_turn(const uint8_t *body, size_t body_len,
+                                const char *content_type,
+                                int opus_rate_hz, int opus_channels,
+                                int opus_frame_ms,
                                 uint8_t **out_wav, size_t *out_wav_len,
                                 voice_turn_meta_t *meta)
 {
@@ -105,12 +108,22 @@ esp_err_t http_post_voice_turn(const uint8_t *wav_data, size_t wav_len,
         return ESP_FAIL;
     }
 
-    esp_http_client_set_header(client, "Content-Type", "audio/wav");
+    esp_http_client_set_header(client, "Content-Type",
+                               content_type ? content_type : "audio/wav");
     const char *unit_id = ws_client_unit_id();
     if (unit_id && unit_id[0]) {
         esp_http_client_set_header(client, "X-DWU-Unit-Id", unit_id);
     }
-    esp_http_client_set_post_field(client, (const char *)wav_data, (int)wav_len);
+    char num[16];
+    if (opus_rate_hz > 0) {
+        snprintf(num, sizeof(num), "%d", opus_rate_hz);
+        esp_http_client_set_header(client, "X-DWU-Opus-Rate", num);
+        snprintf(num, sizeof(num), "%d", opus_channels);
+        esp_http_client_set_header(client, "X-DWU-Opus-Channels", num);
+        snprintf(num, sizeof(num), "%d", opus_frame_ms);
+        esp_http_client_set_header(client, "X-DWU-Opus-Frame-Ms", num);
+    }
+    esp_http_client_set_post_field(client, (const char *)body, (int)body_len);
 
     esp_err_t err = esp_http_client_perform(client);
     if (err != ESP_OK) {

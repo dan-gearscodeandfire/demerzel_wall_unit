@@ -21,8 +21,11 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # Log level
 CONFIG_LOG_DEFAULT_LEVEL_INFO=y
 
-# Stack sizes
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+# Stack sizes. 32 KB main required — libopus encode exceeds 16 KB even with
+# micro-opus's THREADSAFE_PSEUDOSTACK mode. A silent overrun past the
+# canary corrupts adjacent TCBs and manifests as a later FreeRTOS assert
+# in vTaskGenericNotifyGiveFromISR rather than the canary's clean panic.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
 CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
 
 # Watchdog
