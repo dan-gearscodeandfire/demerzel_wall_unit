@@ -62,7 +62,11 @@ const wake_word_frontend_t *g_frontend  = nullptr;
 int g_max_stride_steps   = 1;
 int g_current_stride_step = 0;
 
-uint8_t g_threshold  = 200;  // ~0.78 sigmoid; real-world peaks we've seen are 217–251
+uint8_t g_threshold  = 220;  // ~0.86 sigmoid; raised 2026-04-23 after
+                              // false-positive fires in the den. Real-wake
+                              // peaks are 217-251, so a few low-scoring
+                              // real wakes may miss — iterate up if false
+                              // positives persist, down if real wakes miss.
 uint8_t g_last_score = 0;
 
 // Scratch for one feed() call's features.
