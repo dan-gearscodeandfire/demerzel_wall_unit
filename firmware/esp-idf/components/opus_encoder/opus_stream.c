@@ -43,7 +43,12 @@ esp_err_t opus_stream_create(int sample_rate, int channels, int bitrate_bps,
         return ESP_FAIL;
     }
     opus_encoder_ctl(s->encoder, OPUS_SET_BITRATE(bitrate_bps));
-    opus_encoder_ctl(s->encoder, OPUS_SET_COMPLEXITY(5));
+    // Complexity 0: lowest CPU cost. Measured ~93 ms/frame at complexity 5
+    // on ESP32-S3 (micro-opus has no SIMD/PIE accel) — 4-6x real time, which
+    // made end-to-end turn latency unusable. Complexity 0 trades some
+    // perceptual quality for ~10x encode speedup; whisper transcription is
+    // unaffected at this bitrate.
+    opus_encoder_ctl(s->encoder, OPUS_SET_COMPLEXITY(0));
     opus_encoder_ctl(s->encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
 
     s->sample_rate = sample_rate;

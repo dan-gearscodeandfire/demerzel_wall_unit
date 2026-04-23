@@ -17,9 +17,11 @@
 // ambient motor/HVAC noise as speech at every mode. Capture is now
 // energy-threshold-based. esp-sr dep is retained for future AFE work.
 
-#if CONFIG_DWU_ENCODE_OPUS
+// opus_stream.h is always included — the header is just type declarations
+// (opaque struct + function prototypes). All call sites are still guarded
+// by CONFIG_DWU_ENCODE_OPUS; this just lets the capture helper take an
+// opus_stream_t* parameter regardless of the build config.
 #include "opus_stream.h"
-#endif
 
 // Generate a short tone (sine wave) and play via audio_out.
 // freq_hz: tone frequency, duration_ms: length, rate: sample rate.
@@ -180,8 +182,16 @@ static esp_err_t play_wav(const uint8_t *wav, size_t wav_len)
 // Returns ESP_ERR_TIMEOUT if no speech-level energy was seen in the lead
 // window (spurious wake), ESP_FAIL if speech was too short to route, and
 // ESP_OK with *actual set on normal end-of-utterance or max-duration hit.
+//
+// If enc != NULL (VAD path only), each 20 ms PCM frame is streamed into the
+// Opus encoder as it's captured — this pipelines encode with capture so the
+// upload can start immediately after end-of-speech instead of waiting for a
+// post-hoc encode pass that adds ~real-time latency per second of speech.
+// On encode failure the caller's enc pointer remains valid (ownership is not
+// transferred), but further frames are skipped — caller can fall back to
+// WAV by not finalizing.
 static esp_err_t _capture_utterance(int16_t *pcm, size_t max_samples,
-                                     size_t *actual)
+                                     size_t *actual, opus_stream_t *enc)
 {
     if (actual) *actual = 0;
 
@@ -229,6 +239,23 @@ static esp_err_t _capture_utterance(int16_t *pcm, size_t max_samples,
         int64_t mean_sq = sum_sq / frame_samples;
         if (mean_sq > peak_mean_sq) peak_mean_sq = mean_sq;
         bool is_speech = (mean_sq >= speech_threshold);
+
+        // Pipeline encode: push this frame into the Opus encoder now, while
+        // capture continues in the next iteration. At complexity=0 this costs
+        // ~5-10 ms per frame on ESP32-S3 — well under the 20 ms frame period,
+        // so encode keeps pace with real-time capture. On encode error, stop
+        // feeding further frames but keep capturing so the WAV fallback path
+        // (wav_wrap over pcm[]) still works.
+        if (enc) {
+            esp_err_t er = opus_stream_encode_frame(enc, pcm + total,
+                                                    frame_samples);
+            if (er != ESP_OK) {
+                ESP_LOGW(TAG, "opus encode failed at frame off=%u: %s — "
+                              "will fall back to WAV",
+                         (unsigned)total, esp_err_to_name(er));
+                enc = NULL;
+            }
+        }
 
         total += (size_t)frame_samples;
 
@@ -285,6 +312,9 @@ static esp_err_t _capture_utterance(int16_t *pcm, size_t max_samples,
              speech_frames, (long long)peak_mean_sq);
     return ESP_OK;
 #else
+    // Non-VAD path uses a single bulk read, not frame-at-a-time — pipelined
+    // encode isn't wired here. Caller will encode post-hoc if needed.
+    (void)enc;
     return audio_in_record(pcm, max_samples, actual);
 #endif
 }
@@ -319,14 +349,35 @@ esp_err_t voice_turn_execute(void)
         return ESP_ERR_NO_MEM;
     }
 
+    // Create the Opus encoder BEFORE capture starts so _capture_utterance can
+    // pipeline encode per-frame. If creation fails we still capture and fall
+    // through to the WAV path. enc is declared unconditionally so error-path
+    // cleanup works whether or not Opus is built in.
+    opus_stream_t *enc = NULL;
+#if CONFIG_DWU_ENCODE_OPUS
+    int64_t t_enc_start = 0;
+    {
+        esp_err_t er = opus_stream_create(RECORD_RATE, 1,
+                                           CONFIG_DWU_OPUS_BITRATE_BPS, &enc);
+        if (er != ESP_OK) {
+            ESP_LOGW(TAG, "opus_stream_create failed: %s — WAV fallback",
+                     esp_err_to_name(er));
+            enc = NULL;
+        } else {
+            t_enc_start = esp_timer_get_time();
+        }
+    }
+#endif
+
     size_t actual = 0;
     int64_t t_rec_start = esp_timer_get_time();
-    ret = _capture_utterance(pcm, num_samples, &actual);
+    ret = _capture_utterance(pcm, num_samples, &actual, enc);
 
     if (ret == ESP_ERR_TIMEOUT) {
         // Spurious wake: no speech heard. Quiet return — don't waste a
         // server roundtrip. Error beep disabled here so a mis-fire doesn't
         // produce an audible glitch.
+        if (enc) opus_stream_destroy(enc);
         heap_caps_free(pcm);
         status_led_set(LED_OFF);
         ws_client_send_state("idle", NULL);
@@ -334,6 +385,7 @@ esp_err_t voice_turn_execute(void)
     }
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "capture failed: %s", esp_err_to_name(ret));
+        if (enc) opus_stream_destroy(enc);
         heap_caps_free(pcm);
         status_led_set(LED_RED);
         beep_error();
@@ -357,28 +409,23 @@ esp_err_t voice_turn_execute(void)
     int opus_rate = 0, opus_channels = 0, opus_frame_ms = 0;
 
 #if CONFIG_DWU_ENCODE_OPUS
-    const int frame_samples = RECORD_RATE / 50;  // 20 ms
-    opus_stream_t *enc = NULL;
-    int64_t t_enc_start = esp_timer_get_time();
-    ret = opus_stream_create(RECORD_RATE, 1, CONFIG_DWU_OPUS_BITRATE_BPS, &enc);
-    if (ret == ESP_OK) {
-        size_t off = 0;
-        while (off + (size_t)frame_samples <= actual) {
-            esp_err_t er = opus_stream_encode_frame(enc, pcm + off, frame_samples);
-            if (er != ESP_OK) {
-                ESP_LOGW(TAG, "opus encode stopped at off=%u: %s",
-                         (unsigned)off, esp_err_to_name(er));
-                break;
-            }
-            off += (size_t)frame_samples;
-        }
-        ret = opus_stream_finalize(enc, &body, &body_len);
+    // Encoder was fed frame-by-frame during capture. All we do here is
+    // finalize to claim the accumulated buffer. If finalize returns empty
+    // (encoder errored out mid-capture and we stopped feeding), fall through
+    // to WAV.
+    if (enc) {
+        size_t tmp_len = 0;
+        esp_err_t fin_ret = opus_stream_finalize(enc, &body, &tmp_len);
         opus_stream_destroy(enc);
-        if (ret == ESP_OK && body_len > 0) {
+        enc = NULL;
+        if (fin_ret == ESP_OK && tmp_len > 0) {
+            body_len = tmp_len;
             int enc_ms = (int)((esp_timer_get_time() - t_enc_start) / 1000);
             int pcm_bytes = (int)(actual * sizeof(int16_t));
-            ESP_LOGI(TAG, "Opus encoded: %u bytes (pcm=%d bytes, %.1fx "
-                          "reduction, %d ms)",
+            // enc_ms spans capture+encode since we overlapped them — this is
+            // effectively the capture duration plus a tiny finalize cost.
+            ESP_LOGI(TAG, "Opus encoded (streaming): %u bytes (pcm=%d bytes, "
+                          "%.1fx reduction, capture+encode=%d ms)",
                      (unsigned)body_len, pcm_bytes,
                      (double)pcm_bytes / (double)body_len, enc_ms);
             content_type = "application/x-dwu-opus";
@@ -386,14 +433,12 @@ esp_err_t voice_turn_execute(void)
             opus_channels = 1;
             opus_frame_ms = 20;
         } else {
-            ESP_LOGW(TAG, "opus path produced empty body — falling back to WAV");
+            ESP_LOGW(TAG, "opus finalize empty (fin=%s) — WAV fallback",
+                     esp_err_to_name(fin_ret));
             if (body) heap_caps_free(body);
             body = NULL;
             body_len = 0;
         }
-    } else {
-        ESP_LOGW(TAG, "opus_stream_create failed: %s — falling back to WAV",
-                 esp_err_to_name(ret));
     }
 #endif
 
