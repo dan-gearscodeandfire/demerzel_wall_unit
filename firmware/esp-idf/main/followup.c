@@ -11,6 +11,14 @@ static const char *TAG = "followup";
 
 bool followup_detect_speech(void)
 {
+    // Kill switch: WINDOW_MS=0 disables followup entirely (Session 55 FP
+    // mitigation — one wake-word false positive was amplifying into 3-4
+    // spurious turns because ongoing conversation kept re-firing followup).
+    // Return immediately without the 1 s settle + calibration cost.
+    if (CONFIG_DWU_FOLLOWUP_WINDOW_MS <= 0) {
+        return false;
+    }
+
     int16_t pcm[CHUNK_SAMPLES];
 
     // Flush stale samples (TTS bleed-through sitting in the wake ring).

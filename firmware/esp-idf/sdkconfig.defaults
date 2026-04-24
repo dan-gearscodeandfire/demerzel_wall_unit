@@ -30,3 +30,10 @@ CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
 
 # Watchdog
 CONFIG_ESP_TASK_WDT_TIMEOUT_S=30
+
+# Followup window: disabled by default (Session 55, 2026-04-24). Re-enable by
+# setting CONFIG_DWU_FOLLOWUP_WINDOW_MS > 0 in sdkconfig once wake-word FP
+# rate is confirmed low in your environment. The cascade of a single wake FP
+# into 3-4 spurious turns via followup was a major UX issue; disabling it
+# breaks that amplification path. followup.c early-returns when WINDOW_MS=0.
+CONFIG_DWU_FOLLOWUP_WINDOW_MS=0
